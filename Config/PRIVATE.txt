@@ -63,7 +63,9 @@ CONFIG_PACKAGE_luci-app-cpu-perf=y
 CONFIG_PACKAGE_luci-app-cpu-status=y
 CONFIG_PACKAGE_luci-app-crowdsec-firewall-bouncer=y
 CONFIG_PACKAGE_luci-app-dockerman=y
-CONFIG_PACKAGE_luci-app-emmc-health=y
+# luci-app-emmc-health 已移除：依赖 luci-js-deps（owrt 分支 luci 无此包），
+# 会导致 apk install 依赖解析失败；且 BE10000 为 NAND 非 eMMC。
+# CONFIG_PACKAGE_luci-app-emmc-health=y
 CONFIG_PACKAGE_luci-app-firewall=y
 CONFIG_PACKAGE_luci-app-fwknopd=y
 CONFIG_PACKAGE_luci-app-istorex=y
@@ -104,6 +106,18 @@ CONFIG_PACKAGE_coreutils-lsblk=y
 CONFIG_PACKAGE_zapret2=y
 CONFIG_PACKAGE_tailscale=y
 CONFIG_PACKAGE_kmod-tun=y
+
+# ---------- 修复：LuCI 软依赖的主程序包（上次编译 apk install 报缺失）----------
+# 这些包已由 PRIVATE.sh 从 kenzok8/jell 克隆进 ./package，需在此显式选中，
+# 否则 luci-app 的 "+包名" 软依赖不会自动带上主程序，导致 apk 安装失败。
+CONFIG_PACKAGE_bandix=y
+CONFIG_PACKAGE_unishare=y
+CONFIG_PACKAGE_taskd=y
+CONFIG_PACKAGE_luci-lib-taskd=y
+CONFIG_PACKAGE_docker-lan-bridge=y
+# unishare 的传递依赖（若源内有则选中；无则忽略，Kconfig 会跳过）
+CONFIG_PACKAGE_samba4-server=y
+CONFIG_PACKAGE_webdav2=y
 
 # ---------- 固件体积/分区相关 ----------
 CONFIG_TARGET_ROOTFS_SQUASHFS=y
