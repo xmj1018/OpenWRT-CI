@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+# 自定义编译入口：仅编译 qualcommbe/ipq95xx/xiaomi_be10000
+# 基于 VIKINGYFY/OpenWRT-CI 的 WRT-TEST.yml，固定参数、真正编译（TEST=false）
+
+name: IPQ95XX-BUILD
+
+on:
+  workflow_dispatch:
+
+permissions: write-all
+
+jobs:
+  config:
+    name: IPQ95XX
+    uses: ./.github/workflows/WRT-CORE.yml
+    with:
+      WRT_CONFIG: IPQ95XX
+      WRT_THEME: vantage
+      # 主机名设为 immortalwrt（左上角品牌另由 Settings 补丁处理）
+      WRT_NAME: immortalwrt
+      WRT_SSID: OWRT
+      WRT_WORD: 12345678
+      WRT_IP: 192.168.10.1
+      WRT_PW: 无
+      WRT_REPO: https://github.com/VIKINGYFY/immortalwrt.git
+      WRT_BRANCH: owrt
+      WRT_SOURCE: VIKINGYFY/immortalwrt
+      WRT_PACKAGE: ''
+      WRT_TEST: false
