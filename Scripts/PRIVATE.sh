@@ -9,8 +9,9 @@ echo " "
 echo "========== Load PRIVATE.sh (custom packages) =========="
 
 # ---------------- honk（用户指定：kenzok8/openwrt-honk）----------------
-# 官方 Packages.sh 未包含 honk；这里克隆 honk 仓库并把 honk/ 与 luci-app-honk/ 提取到 package/
+# 官方 Packages.sh 未包含 honk；克隆 honk 仓库并把 honk/ 与 luci-app-honk/ 提取到 package/
 # pkg 模式会按 *honk* 匹配仓库内的子目录并复制到 ./package
+# 产物预期：honk-2026.11.18.1-r2-aarch64_cortex-a53.apk / luci-app-honk-...apk
 rm -rf ./package/honk ./package/luci-app-honk ./package/openwrt-honk 2>/dev/null
 UPDATE_PACKAGE "honk" "kenzok8/openwrt-honk" "main" "pkg" "honk luci-app-honk doona luci-app-doona"
 UPDATE_PACKAGE "luci-app-honk" "kenzok8/openwrt-honk" "main" "pkg"
@@ -26,12 +27,23 @@ if [ ! -d "./package/luci-app-oaf" ]; then
 fi
 
 # ---------------- kenzok8/jell 聚合源中的冷门插件（pkg 提取）----------------
-# 这些插件官方源没有，从 jell 大杂烩按包名单独提取
-for PKG in luci-app-bandix luci-app-cpu-perf luci-app-cpu-status \
-           luci-app-shadowrt luci-app-temp-status luci-app-unishare \
+# 这些插件官方源没有，从 jell 大杂烩按包名单独提取。
+# 关键：UPDATE_PACKAGE 的 pkg 模式用 iname "*<名>*" 模糊匹配子目录。
+# 因此用主程序名（而非 luci-app- 名）可同时抓到「界面 + 主程序」，避免
+# apk install 时报 "<主程序> (no such package)" 依赖缺失。
+#   bandix -> luci-app-bandix + openwrt-bandix
+#   unishare -> luci-app-unishare + unishare (+ webdav2 传递依赖)
+for PKG in bandix unishare docker-lan-bridge webdav2 \
+           luci-app-cpu-perf luci-app-cpu-status \
+           luci-app-shadowrt luci-app-temp-status \
            luci-app-nikki luci-app-mosdns luci-app-passwall; do
   UPDATE_PACKAGE "$PKG" "kenzok8/jell" "main" "pkg"
 done
+# luci-lib-taskd + taskd：必须从 openwrt-packages 源（与 istorex/store 同源），
+# 该源 luci-lib-taskd 版本 1.0.26，满足 istorex>=1.0.15 / store>=1.0.19 约束。
+# iname "taskd" 会同时抓到 taskd 和 luci-lib-taskd 两个目录。
+UPDATE_PACKAGE "taskd" "kenzok8/openwrt-packages" "master" "pkg"
+
 
 # ---------------- istorex / quickstart / store / quickfile ----------------
 # 注意：kenzok8/openwrt-packages 默认分支是 master（非 main）
@@ -41,8 +53,9 @@ UPDATE_PACKAGE "store" "kenzok8/openwrt-packages" "master" "pkg" "luci-app-store
 UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main" "" "luci-app-quickfile quickfile"
 
 # ---------------- 单独源插件 ----------------
-# eMMC 健康度（BE10000 为 NAND，如编译期内核依赖不兼容可在 PRIVATE.txt 禁用此项）
-UPDATE_PACKAGE "luci-app-emmc-health" "adminchenyu/eMMC-Health" "main"
+# eMMC 健康度：已移除。原因：该插件依赖 luci-js-deps（新版 luci 组件），
+# 而 owrt 分支 luci 无此包，会导致 apk install 阶段依赖解析失败；且 BE10000
+# 为 NAND 并非 eMMC，此插件对本机意义有限。需要时可在新版 luci 上单独装。
 # 端口视图
 UPDATE_PACKAGE "portweaver" "LazuliKao/openwrt-portweaver" "main" "pkg" "luci-app-portweaver"
 # zapret2（DPI 绕过）
