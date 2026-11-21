@@ -20,12 +20,10 @@ UPDATE_PACKAGE "luci-app-honk" "kenzok8/openwrt-honk" "main" "pkg"
 UPDATE_PACKAGE "v2ray-geodata" "kenzok8/small" "master" "" "v2ray-geoip v2ray-geosite"
 
 # ---------------- OAF（应用过滤）----------------
-# destan19/OpenAppFilter 自带 appfilter + oaf + luci-app-oaf 一整套，同源避免 rpcd acl 冲突
+# destan19/OpenAppFilter 同源一整套（appfilter 7.0.2 + oaf + luci-app-oaf 7.0-r2 + kmod-oaf）版本配套。
+# 关键：不要再单独克隆 kenzok8/jell 的 luci-app-oaf —— 那个版本是 0，会和 appfilter 7.0.2
+# 同时提供 usr/share/rpcd/acl.d/luci-app-oaf.json 导致打包 trying to overwrite 失败。
 UPDATE_PACKAGE "open-app-filter" "destan19/OpenAppFilter" "master" "" "luci-app-appfilter oaf open-app-filter"
-if [ ! -d "./package/luci-app-oaf" ]; then
-  UPDATE_PACKAGE "luci-app-oaf" "kenzok8/jell" "main" "pkg"
-  UPDATE_PACKAGE "oaf" "kenzok8/jell" "main" "pkg"
-fi
 
 # ---------------- iStoreOS 风格 ----------------
 # 依赖链：luci-app-quickstart→quickstart/luci-app-store；istorex/store→luci-lib-taskd；
