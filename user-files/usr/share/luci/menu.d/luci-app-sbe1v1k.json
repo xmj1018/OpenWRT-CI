@@ -1,0 +1,18 @@
+{
+	"admin/system/fan": {
+		"title": "风扇控制",
+		"order": 95,
+		"action": {
+			"type": "view",
+			"path": "sbe1v1k/fan"
+		}
+	},
+	"admin/system/led": {
+		"title": "RGB 状态灯",
+		"order": 96,
+		"action": {
+			"type": "view",
+			"path": "sbe1v1k/led"
+		}
+	}
+}
