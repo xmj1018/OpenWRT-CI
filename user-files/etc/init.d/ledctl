@@ -3,7 +3,23 @@
 START=99
 USE_PROCD=1
 
+# 硬件守卫：后端只认 /sys/class/leds/{red,green,blue}:status 三色 PWM LED。
+# 没这套节点的机型不启动守护（灯效循环是死循环，空转会白占 CPU）。
+led_hw_present() {
+	[ -d /sys/class/leds/red:status ] && [ -d /sys/class/leds/green:status ] && [ -d /sys/class/leds/blue:status ] && return 0
+	for l in /sys/class/leds/*:status; do
+		[ -d "$l" ] || continue
+		case "$l" in *red*) return 0 ;; esac
+	done
+	return 1
+}
+
 start_service() {
+	led_hw_present || {
+		logger -t ledctl "RGB status LED not found, daemon skipped (unsupported hardware)" 2>/dev/null || :
+		return 0
+	}
+
 	config_load led
 	config_get mode led mode static
 	config_get en   led enabled 1
