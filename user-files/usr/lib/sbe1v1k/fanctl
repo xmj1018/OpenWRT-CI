@@ -1,0 +1,624 @@
+#!/bin/sh
+# fanctl - SBE1V1K PWM 风扇控制
+#
+# 硬件（2026-11-01 实测）：
+#   IPQ9570 PWM 通道 3 -> pwm-fan，cooling-levels = <36 72 128 255>
+#   hwmon name=pwmfan          -> /sys/class/hwmon/hwmon14（编号会变，按 name 找）
+#   散热设备 type=pwm-fan      -> cooling_device1（cur_state 0..3）
+#   温区 top-glue-thermal      -> thermal_zone12（trip 40/50/65/80°C）
+#
+# 实测要点：
+#   1) pwm1_enable 接受 0/1/2；2=内核 thermal，1=手动
+#   2) 手动写 pwm1 后 thermal 不会抢回（同温度档内）
+#   3) ⚠️ 从手动切回 auto（enable=2）时 thermal 不会重发同档位，
+#      pwm1 停在上次手动的残值（写 0 后切自动 = 风扇一直停）
+#      => 切 auto 必须主动写一次 cooling_device 的 cur_state
+#   4) 🔴 手动/曲线模式下 governor 仍每轮把 pwm 抢回 cur_state 对应值
+#      （温度一掉到 trip 以下就变回 14%）=> 必须先 `echo disabled > thermal_zoneN/mode`
+#      交出温区控制权，切回 auto 时再 `echo enabled`
+#
+# 用法：
+#   fanctl status | json | sensors
+#   fanctl auto | manual <0-100> | off
+#   fanctl curve [曲线] [--src max|soc]
+#   fanctl apply | daemon
+
+HWMON=""
+COOL=""
+
+[ -f /lib/functions.sh ] && . /lib/functions.sh
+
+find_hwmon() {
+	[ -n "$HWMON" ] && [ -d "$HWMON" ] && return 0
+	for d in /sys/class/hwmon/hwmon*; do
+		[ -r "$d/name" ] || continue
+		[ "$(cat "$d/name" 2>/dev/null)" = "pwmfan" ] && { HWMON="$d"; return 0; }
+	done
+	return 1
+}
+
+find_cool() {
+	[ -n "$COOL" ] && [ -d "$COOL" ] && return 0
+	for c in /sys/class/thermal/cooling_device*; do
+		[ -r "$c/type" ] || continue
+		[ "$(cat "$c/type" 2>/dev/null)" = "pwm-fan" ] && { COOL="$c"; return 0; }
+	done
+	return 1
+}
+
+# 找出所有把 pwm-fan 当冷却设备的温区（本机只有 top-glue-thermal）
+fan_zones() {
+	for z in /sys/class/thermal/thermal_zone*; do
+		[ -d "$z" ] || continue
+		for c in "$z"/cdev*; do
+			[ -e "$c" ] || continue
+			[ "$(cat "$(readlink -f "$c")/type" 2>/dev/null)" = "pwm-fan" ] || continue
+			echo "$z"; break
+		done
+	done
+}
+
+# 用户态接管 / 交还内核 governor
+set_thermal() { for z in $(fan_zones); do echo "$1" > "$z/mode" 2>/dev/null; done; }
+
+thermal_state() {
+	for z in $(fan_zones); do cat "$z/mode" 2>/dev/null; return; done
+	echo unknown
+}
+
+pwm_raw()      { find_hwmon && cat "$HWMON/pwm1" 2>/dev/null || echo 0; }
+enable_state() { find_hwmon && cat "$HWMON/pwm1_enable" 2>/dev/null || echo -1; }
+set_enable()   { find_hwmon && echo "$1" > "$HWMON/pwm1_enable" 2>/dev/null; }
+
+# 转速计（GPIO40，每转 2 脉冲）。仅含 tach 修正的固件才有 fan1_input，
+# 读不到返回 -1（前端显示「不可用」）；0 表示风扇停转，是有效值。
+fan_rpm() {
+	find_hwmon || { echo -1; return; }
+	r=$(cat "$HWMON/fan1_input" 2>/dev/null)
+	case "$r" in ''|*[!0-9]*) echo -1 ;; *) echo "$r" ;; esac
+}
+
+set_pwm() {
+	find_hwmon || return 1
+	v=$1
+	case "$v" in ''|*[!0-9-]*) v=0 ;; esac
+	[ "$v" -lt 0 ] && v=0
+	[ "$v" -gt 255 ] && v=255
+	echo "$v" > "$HWMON/pwm1" 2>/dev/null
+}
+
+# ---------- 传感器 ----------
+
+# 行格式：key|显示名|温度(摄氏)
+# ath12k 三路按 WSI radio 索引（= uci radioN.radio = MLO link ID）顺序注册，
+# 频段从 uci 反查：radio0 2g -> radio=2，radio1 6g -> radio=0，radio2 5g -> radio=1
+# 按 radio 硬件索引排序输出「索引 段名」。
+# 三个 hwmon 是按射频 probe 顺序注册的，顺序与 radio 索引一致，
+# 所以第 N 个 ath12k hwmon 就对应索引为 N 的那个 radio。
+radio_order() {
+	for r in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\(radio[0-9]*\)=wifi-device$/\1/p'); do
+		idx=$(uci -q get wireless.$r.radio 2>/dev/null)
+		case "$idx" in ''|*[!0-9]*) continue ;; esac
+		echo "$idx $r"
+	done | sort -n
+}
+
+wifi_band_label() {
+	idx=$1
+	for r in radio0 radio1 radio2; do
+		[ "$(uci -q get wireless.$r.radio 2>/dev/null)" = "$idx" ] || continue
+		case "$(uci -q get wireless.$r.band 2>/dev/null)" in
+			2g) echo "Wi-Fi 2.4 GHz 射频" ;;
+			5g) echo "Wi-Fi 5 GHz 射频" ;;
+			6g) echo "Wi-Fi 6 GHz 射频" ;;
+			*)  echo "Wi-Fi 射频 #$(($idx + 1))" ;;
+		esac
+		return
+	done
+	echo "Wi-Fi 射频 #$(($idx + 1))"
+}
+
+# 读超时的传感器拉黑一段时间，避免每轮都白等 1 秒
+BADLIST=/tmp/.fan-bad
+is_bad() {
+	[ -f "$BADLIST" ] || return 1
+	bn=${1##*/}
+	now=$(date +%s)
+	while read -r b t; do
+		[ "$b" = "$bn" ] || continue
+		[ $((now - t)) -lt ${FAN_BAD_TTL:-600} ] && return 0
+	done < "$BADLIST"
+	return 1
+}
+
+STRIKES=/tmp/.fan-strikes
+mark_bad() {
+	[ -n "$1" ] || return 0
+	b=${1##*/}
+	now=$(date +%s)
+	ttl=${FAN_BAD_TTL:-600}
+	n=0
+	if [ -f "$STRIKES" ]; then
+		prev=$(awk -v b="$b" '$1==b{print $2, $3}' "$STRIKES" 2>/dev/null | tail -1)
+		set -- $prev
+		case "$1" in ''|*[!0-9]*) n=0 ;; esac
+		case "$2" in ''|*[!0-9]*) n=0 ;; esac
+		[ "$n" -gt 0 ] && [ $((now - $2)) -ge "$ttl" ] && n=0
+	fi
+	case "$n" in ''|*[!0-9]*) n=0 ;; esac
+	n=$((n + 1))
+	if [ -f "$STRIKES" ]; then
+		awk -v b="$b" '$1!=b' "$STRIKES" 2>/dev/null > "$STRIKES.t"
+		echo "$b $n $now" >> "$STRIKES.t"
+		mv "$STRIKES.t" "$STRIKES" 2>/dev/null
+	else
+		echo "$b $n $now" > "$STRIKES" 2>/dev/null
+	fi
+	# 连续两次读不到才拉黑：冷启动时射频固件可能只是慢一拍，
+	# 一次超时就把好传感器拉黑会让页面漏掉真实的发热点
+	[ "$n" -ge 2 ] && echo "$b $now" >> "$BADLIST" 2>/dev/null
+	return 0
+}
+
+sensor_list() {
+	tmpd="/tmp/.fan-sens.$$"
+	rm -rf "$tmpd" 2>/dev/null
+	mkdir -p "$tmpd" 2>/dev/null || return 0
+
+	# 清理过期条目
+	if [ -f "$BADLIST" ]; then
+		now=$(date +%s)
+		while read -r b t; do
+			[ $((now - t)) -lt ${FAN_BAD_TTL:-600} ] && echo "$b $t"
+		done < "$BADLIST" > "$tmpd/bad" 2>/dev/null
+		mv "$tmpd/bad" "$BADLIST" 2>/dev/null
+	fi
+
+	# 🔴 三个 ath12k 的 temp1_input 在驱动层是【串行】的：
+	#    某个射频卡住（固件读温度超时 10 秒且不可中断）会把后面的全拖死，
+	#    并发读取也救不了。所以已停用的 radio 必须【完全不读】。
+	#    映射依据：hwmon 按射频 probe 顺序注册，与 uci 里的 radio 索引一致。
+	radio_order > "$tmpd/order" 2>/dev/null
+	n_rad=$(wc -l < "$tmpd/order" 2>/dev/null)
+	case "$n_rad" in ''|*[!0-9]*) n_rad=0 ;; esac
+	n_ath=0
+	for d in /sys/class/hwmon/hwmon*; do
+		[ "$(cat "$d/name" 2>/dev/null)" = "ath12k_hwmon" ] && n_ath=$((n_ath + 1))
+	done
+	# 数量对不上就不敢按位置跳（宁可多读，也不漏真实的发热点）
+	use_map=0
+	[ "$n_rad" -gt 0 ] && [ "$n_rad" = "$n_ath" ] && use_map=1
+
+	i=0
+	pids=""
+	aidx=""
+	async=0
+	wseq=0
+	for d in /sys/class/hwmon/hwmon*; do
+		[ -r "$d/name" ] || continue
+		is_bad "$d" && continue
+		i=$((i + 1))
+		echo "$d" > "$tmpd/$i.path" 2>/dev/null
+		cat "$d/name" > "$tmpd/$i.name" 2>/dev/null
+		if [ "$(cat "$tmpd/$i.name" 2>/dev/null)" = "ath12k_hwmon" ]; then
+			echo "$wseq" > "$tmpd/$i.ord" 2>/dev/null
+			skip=0
+			if [ "$use_map" = "1" ]; then
+				rs=$(awk -v p=$((wseq + 1)) 'NR==p{print $2}' "$tmpd/order" 2>/dev/null)
+				if [ -n "$rs" ] && [ "$(uci -q get wireless.$rs.disabled 2>/dev/null)" = "1" ]; then
+					skip=1
+					echo 1 > "$tmpd/$i.skip" 2>/dev/null
+				fi
+			fi
+			wseq=$((wseq + 1))
+			[ "$skip" = "1" ] && continue
+			( timeout 2 cat "$d/temp1_input" > "$tmpd/$i.val" 2>/dev/null ) &
+			pids="$pids $!"
+			aidx="$aidx $i"
+			async=1
+		else
+			timeout 2 cat "$d/temp1_input" > "$tmpd/$i.val" 2>/dev/null
+		fi
+	done
+	# 只有确实起了异步读取才等；射频全被跳过时这里直接跳过，零等待
+	if [ "$async" = "1" ]; then
+		# 正常情况几十毫秒就读齐了，密集轮询避免白等；
+		# 真遇到卡住的射频再兜底等 1 秒（它的读不可中断，杀了也要等固件超时）
+		pending=1
+		tries=0
+		while [ "$tries" -lt 60 ]; do
+			pending=0
+			for a in $aidx; do
+				if [ ! -s "$tmpd/$a.val" ]; then pending=1; break; fi
+			done
+			[ "$pending" = "0" ] && break
+			tries=$((tries + 1))
+		done
+		if [ "$pending" = "1" ]; then
+			# 已经按 radio 索引跳过停用射频，仍然卡住 = 映射假设可能不成立
+			# （不同批次硬件、probe 顺序不同）。留个日志方便排查。
+			nskip=$(ls "$tmpd"/*.skip 2>/dev/null | wc -l)
+			logger -t fanctl "sensor read stalled (skipped=${nskip:-0}), radio/hwmon mapping may be wrong" 2>/dev/null
+			sleep 1
+		fi
+		for p in $pids; do kill "$p" 2>/dev/null; done
+	fi
+
+	k=0
+	while [ "$k" -lt "$i" ]; do
+		k=$((k + 1))
+		# 被主动跳过的（停用射频）不参与读数，也不要拉黑
+		[ -f "$tmpd/$k.skip" ] && continue
+		n=$(cat "$tmpd/$k.name" 2>/dev/null)
+		t=$(cat "$tmpd/$k.val" 2>/dev/null)
+		case "$t" in
+			''|*[!0-9-]*)
+				# 有 temp1_input 却读不出来 = 固件卡住，累计两次才拉黑
+				_bp=$(cat "$tmpd/$k.path" 2>/dev/null)
+				[ -n "$_bp" ] && [ -e "$_bp/temp1_input" ] && mark_bad "$_bp"
+				continue ;;
+		esac
+		t=$((t / 1000))
+		# 格式：key|细分名|温度|类别名
+		#   细分名用于「展开全部」，类别名用于默认的合并视图
+		case "$n" in
+			pwmfan) ;;
+			top_glue_thermal)  echo "soc|SoC / 主板|$t|SoC / 主板" ;;
+			nss_top_thermal)   echo "nss|NSS 网络加速|$t|NSS 网络加速" ;;
+			wcss_phyb_thermal) echo "wlan|WLAN 子系统|$t|WLAN 子系统" ;;
+			ath12k_hwmon)
+				ord=$(cat "$tmpd/$k.ord" 2>/dev/null)
+				case "$ord" in ''|*[!0-9]*) ord=0 ;; esac
+				_bl=$(wifi_band_label "$ord")
+				echo "wifi$((ord + 1))|$_bl|$t|$_bl" ;;
+			*mdio*)            echo "phy|以太网 PHY|$t|以太网 PHY" ;;
+			cpuss*_thermal)
+				_num=${n#cpuss}; _num=${_num%_thermal}
+				echo "cpu|CPUSS $_num|$t|CPU 核心" ;;
+			cpu*_thermal)
+				_num=${n#cpu}; _num=${_num%_thermal}
+				echo "cpu|CPU $_num|$t|CPU 核心" ;;
+			ubi_*_thermal)
+				_num=${n#ubi_}; _num=${_num%_thermal}
+				echo "ubi|UBI $_num|$t|UBI 总线" ;;
+		esac
+	done
+
+	rm -rf "$tmpd" 2>/dev/null
+}
+
+temp_c() {
+	for z in /sys/class/thermal/thermal_zone*; do
+		[ "$(cat "$z/type" 2>/dev/null)" = "top-glue-thermal" ] || continue
+		mc=$(cat "$z/temp" 2>/dev/null)
+		case "$mc" in ''|*[!0-9-]*) echo 0; return ;; esac
+		echo $((mc / 1000)); return
+	done
+	echo 0
+}
+
+# 一次 fanctl 调用内只枚举一次传感器（json 会同时用到最热值和列表）
+SENS_CACHE=""
+sensors_cached() {
+	[ -n "$SENS_CACHE" ] || SENS_CACHE=$(sensor_list)
+	echo "$SENS_CACHE"
+}
+
+hottest_c() { sensors_cached | cut -d'|' -f3 | sort -n | tail -1; }
+
+# ---------- 曲线 ----------
+
+curve_pct() {
+	t=$1; c="$2"
+	[ -n "$c" ] || { echo 50; return; }
+	c=$(echo "$c" | tr ',' '\n' | grep -E '^[0-9]+:[0-9]+$' | sort -t: -k1,1n | tr '\n' ',')
+	[ -n "$c" ] || { echo 50; return; }
+	prev_t=""; prev_p=""
+	old_ifs=$IFS; IFS=,
+	for seg in $c; do
+		st=${seg%%:*}; sp=${seg##*:}
+		[ "$sp" -gt 100 ] && sp=100
+		if [ -z "$prev_t" ]; then
+			[ "$t" -le "$st" ] && { IFS=$old_ifs; echo "$sp"; return; }
+			prev_t=$st; prev_p=$sp
+		else
+			if [ "$t" -le "$st" ]; then
+				dt=$((st - prev_t)); dp=$((sp - prev_p))
+				if [ "$dt" -le 0 ]; then IFS=$old_ifs; echo "$sp"; return; fi
+				IFS=$old_ifs
+				echo $((prev_p + (t - prev_t) * dp / dt))
+				IFS=,; return
+			fi
+			prev_t=$st; prev_p=$sp
+		fi
+	done
+	IFS=$old_ifs
+	echo "${prev_p:-50}"
+}
+
+# 温度 -> 内核档位（trip 40/50/65/80 对应 state 0/1/2/3）
+# 内核当前档位（0..3）。auto 模式下这才是真实生效的档位；
+# level_for_temp 只是按 SoC 温度估算，两者可能不一致（例如刚切回自动时）。
+cool_state() {
+	find_cool || { echo -1; return; }
+	cat "$COOL/cur_state" 2>/dev/null || echo -1
+}
+
+level_for_temp() {
+	t=$1
+	[ "$t" -ge 80 ] && { echo 3; return; }
+	[ "$t" -ge 65 ] && { echo 2; return; }
+	[ "$t" -ge 50 ] && { echo 1; return; }
+	echo 0
+}
+
+sync_cool() {
+	find_cool || return 1
+	want=$1
+	cur=$(cat "$COOL/cur_state" 2>/dev/null)
+	# thermal 对「写入同值」不会回调驱动，必须先制造一次变化
+	if [ "$cur" = "$want" ]; then
+		if [ "$want" = "0" ]; then
+			echo 1 > "$COOL/cur_state" 2>/dev/null
+		else
+			echo 0 > "$COOL/cur_state" 2>/dev/null
+		fi
+	fi
+	echo "$want" > "$COOL/cur_state" 2>/dev/null
+}
+
+uci_set() {
+	[ -f /etc/config/fan ] || return 0
+	uci set "$@" 2>/dev/null && uci commit fan 2>/dev/null
+}
+
+# 守护常驻：曲线模式负责调速，其它模式只做过温兜底
+ensure_daemon() {
+	[ -n "$FAN_NO_DAEMON" ] && return 0   # init 脚本内部调用时避免递归
+	[ -x /etc/init.d/fanctl ] || return 0
+	pgrep -f "fanctl daemon" >/dev/null 2>&1 && return 0
+	# FAN_SKIP_APPLY=1：只要守护进程，不要 init 脚本再跑一遍 apply。
+	# （apply 会重新提交配置，既多余又容易和刚写入的值打架）
+	FAN_SKIP_APPLY=1 /etc/init.d/fanctl start >/dev/null 2>&1
+}
+
+# ---------- 动作 ----------
+
+do_auto() {
+	# 先落 mode，守护下一轮就不会再写 pwm
+	uci_set fan.@fan[0].mode='auto'
+	# 交还内核温区控制权，并让 governor 重新接管
+	set_thermal enabled
+	set_enable 2 || set_enable 1
+	lv=$(level_for_temp "$(temp_c)")
+	sync_cool "$lv"
+	# 校验：自动档位最低也是 36，读到 0 说明没下发成功，补一次
+	[ "$(pwm_raw)" = "0" ] && sync_cool "$lv"
+	ensure_daemon
+}
+
+# 按【原始 PWM 值 0-255】设置转速（配置文件里存的就是这个值）
+apply_manual_raw() {
+	raw=$1
+	case "$raw" in ''|*[!0-9]*) raw=128 ;; esac
+	[ "$raw" -gt 255 ] && raw=255
+	uci_set fan.@fan[0].mode='manual'
+	# 必须先关 governor：否则 thermal 下一轮就把 pwm 改回 cur_state 对应档位
+	set_thermal disabled
+	set_enable 1
+	set_pwm "$raw"
+	uci_set fan.@fan[0].pwm="$raw"
+	ensure_daemon
+}
+
+# 按【百分比 0-100】设置转速（命令行与界面用的是这个）
+apply_manual() {
+	p=$1; nosave=$2
+	case "$p" in ''|*[!0-9]*) p=50 ;; esac
+	[ "$p" -gt 100 ] && p=100
+	raw=$(( (p * 255 + 50) / 100 ))
+	[ "$nosave" = "--nosave" ] || uci_set fan.@fan[0].mode='manual'
+	# 必须先关 governor：否则 thermal 下一轮就把 pwm 改回 cur_state 对应档位
+	set_thermal disabled
+	set_enable 1
+	set_pwm "$raw"
+	# 拖动滑块时用 --nosave，避免每次 input 都 commit 写 flash
+	[ "$nosave" = "--nosave" ] && { ensure_daemon; return 0; }
+	uci_set fan.@fan[0].pwm="$raw"
+	ensure_daemon
+}
+
+do_off() {
+	uci_set fan.@fan[0].mode='off'
+	set_thermal disabled
+	set_enable 1
+	set_pwm 0
+	ensure_daemon
+}
+
+do_curve_once() {
+	curve=$1; src=$2
+	t=$(temp_c)
+	[ "$src" = "max" ] && t=$(hottest_c)
+	set_thermal disabled
+	set_enable 1
+	set_pwm $(( ($(curve_pct "$t" "$curve") * 255 + 50) / 100 ))
+}
+
+do_daemon() {
+	grd=${FAN_GUARD:-92}
+	over=0
+	while :; do
+		config_load fan
+		config_get mode  fan mode  curve
+		config_get curve fan curve "40:20,50:35,65:60,80:100"
+		config_get src   fan src   max
+
+		if [ "$mode" = "auto" ]; then
+			# 内核接管：确保温区 enabled，本守护完全不碰 pwm
+			[ "$(thermal_state)" = "enabled" ] || set_thermal enabled
+			over=0
+			sleep 10
+			continue
+		fi
+
+		# 非自动模式：governor 必须让开，否则 pwm 会被按 cur_state 抢回
+		[ "$(thermal_state)" = "disabled" ] || set_thermal disabled
+		[ "$(enable_state)" = "1" ] || set_enable 1
+
+		h=$(hottest_c)
+		case "$h" in ''|*[!0-9]*) h=0 ;; esac
+
+		if [ "$h" -ge "$grd" ]; then
+			# 过温兜底：任何用户态模式下都强制全速，防止手动 0% 烤硬件
+			if [ "$over" = "0" ]; then
+				set_pwm 255
+				logger -t fanctl "overtemp ${h}C >= ${grd}C, fan forced to 100%"
+				over=1
+			fi
+		else
+			if [ "$over" = "1" ]; then
+				logger -t fanctl "temperature back to ${h}C, resume ${mode} mode"
+				over=0
+				# 还原用户在过温之前设定的转速。
+				# 不还原的话风扇会永远停在 100%，直到用户手动改一次。
+				case "$mode" in
+					manual)
+						pv=$(uci -q get fan.@fan[0].pwm)
+						case "$pv" in ''|*[!0-9]*) pv=128 ;; esac
+						set_pwm "$pv" ;;
+					off)
+						set_pwm 0 ;;
+				esac
+			fi
+			if [ "$mode" = "curve" ]; then
+				# 再确认一次模式，缩小与切模式的竞态窗口
+				m2=$(uci -q get fan.@fan[0].mode)
+				if [ "$m2" = "curve" ]; then
+					t=$(temp_c)
+					[ "$src" = "max" ] && t="$h"
+					set_pwm $(( ($(curve_pct "$t" "$curve") * 255 + 50) / 100 ))
+				fi
+			fi
+		fi
+		sleep 10
+	done
+}
+
+do_apply() {
+	config_load fan
+	config_get mode  fan mode  auto
+	config_get pwmv  fan pwm   50
+	config_get curve fan curve "40:20,50:35,65:60,80:100"
+	config_get src   fan src   max
+	case "$mode" in
+		auto)   do_auto ;;
+		manual) apply_manual_raw "$pwmv" ;;
+		off)    do_off ;;
+		curve)  do_curve_once "$curve" "$src" ;;
+		*) do_auto ;;
+	esac
+}
+
+# ---------- 输出 ----------
+
+# 同类聚合取最大，按温度降序
+# 注：busybox 的 sort 对 -t/-k 支持不可靠（实测按第一字段排），
+#     因此把温度放首位，整行数字排序后再换回 key|name|temp
+# 同类传感器合并：4 路 UBI、6 路 CPU 内核各自只留最热的那个。
+# 输入输出都是「key|名称|温度」，输出按温度降序，方便前端直接取首条为最热。
+merge_sensors() {
+	awk -F'|' '
+		{ if ($3+0 > max[$1]) { max[$1] = $3+0; nm = $4; if (nm == "") nm = $2; name[$1] = nm } }
+		END { for (k in max) printf "%d|%s|%s\n", max[k], k, name[k] }' |
+		sort -rn |
+		awk -F'|' '{ printf "%s|%s|%s\n", $2, $3, $1 }'
+}
+
+do_sensors() { sensors_cached | merge_sensors; }
+
+do_json() {
+	find_hwmon || { echo '{"ok":false,"error":"no-pwmfan"}'; return 1; }
+	config_load fan
+	config_get mode  fan mode  auto
+	config_get curve fan curve "40:20,50:35,65:60,80:100"
+	config_get src   fan src   max
+	raw=$(pwm_raw)
+	# 一次枚举同时算最热值和列表，避免重复读取（坏传感器每次要等 1 秒）
+	SLIST=$(sensor_list)
+	# 必须走聚合：原始列表里 UBI 有 4 路、CPU 有 6 路，直接下发会重复
+	MLIST=$(echo "$SLIST" | merge_sensors)
+	hot=$(echo "$MLIST" | cut -d'|' -f3 | head -1)
+	[ -n "$hot" ] || hot=$(temp_c)
+	sensors=$(echo "$MLIST" | awk -F'|' '{printf "%s{\"key\":\"%s\",\"name\":\"%s\",\"temp\":%d}", (NR>1?",":""), $1, $2, $3}')
+	# 未合并的完整列表，「展开全部」用；按温度降序
+	sensors_all=$(echo "$SLIST" | awk -F'|' '{printf "%d|%s|%s\n", $3+0, $1, $2}' | sort -rn | awk -F'|' '{printf "%s{\"key\":\"%s\",\"name\":\"%s\",\"temp\":%d}", (NR>1?",":""), $2, $3, $1}')
+	[ -n "$sensors_all" ] || sensors_all=$sensors
+	cfg=0; [ -f /etc/config/fan ] && cfg=1
+	echo "{\"ok\":true,\"temp\":$(temp_c),\"hot\":$hot,\"pwm\":$raw,\"rpm\":$(fan_rpm),\"pct\":$(( (raw * 100 + 127) / 255 )),\"level\":$(level_for_temp "$(temp_c)"),\"cur\":$(cool_state),\"enable\":$(enable_state),\"mode\":\"$mode\",\"curve\":\"$curve\",\"src\":\"$src\",\"thermal\":\"$(thermal_state)\",\"cfg\":$cfg,\"sensors\":[$sensors],\"sensors_all\":[$sensors_all]}"
+}
+
+do_status() {
+	find_hwmon || { echo "未找到 pwmfan"; return 1; }
+	config_load fan
+	config_get mode fan mode auto
+	raw=$(pwm_raw)
+	cur="?"
+	find_cool && cur=$(cat "$COOL/cur_state" 2>/dev/null)
+	echo "温度   : $(temp_c) °C（top-glue）  最热 $(hottest_c) °C"
+	echo "PWM    : $raw/255  ($((raw * 100 / 255))%)"
+	_rpm=$(fan_rpm)
+	[ "$_rpm" -ge 0 ] 2>/dev/null && echo "转速   : $_rpm RPM" || echo "转速   : 不可用（无 tach）"
+	echo "档位   : cooling cur_state=$cur（0..3，对应 14/28/50/100%）"
+	echo "模式   : $mode（pwm1_enable=$(enable_state)）"
+	echo "温控   : $(thermal_state)（enabled=内核 governor 接管，disabled=用户态接管）"
+	echo "hwmon  : $HWMON"
+	echo "--- 传感器 ---"
+	do_sensors | awk -F'|' '{printf "  %-18s %s °C\n", $2, $3}'
+}
+
+case "$1" in
+	status)  do_status ;;
+	json)    do_json ;;
+	sensors) do_sensors ;;
+	auto)    do_auto ;;
+	manual)
+		ns=""
+		[ "$3" = "--nosave" ] && ns="--nosave"
+		apply_manual "$2" "$ns" ;;
+	off)     do_off ;;
+	curve)
+		shift
+		ccurve=""; csrc=""
+		while [ -n "$1" ]; do
+			case "$1" in
+				--src) csrc="$2"; shift 2 ;;
+				*)     ccurve="$1"; shift ;;
+			esac
+		done
+		[ -n "$ccurve" ] && uci_set fan.@fan[0].curve="$ccurve"
+		[ -n "$csrc" ]   && uci_set fan.@fan[0].src="$csrc"
+		uci_set fan.@fan[0].mode='curve'
+		config_load fan
+		config_get curve fan curve "${ccurve:-40:20,50:35,65:60,80:100}"
+		config_get src   fan src   "${csrc:-max}"
+		do_curve_once "$curve" "$src"
+		ensure_daemon ;;
+	setcurve)
+		shift
+		ccurve=""; csrc=""
+		while [ -n "$1" ]; do
+			case "$1" in
+				--src) csrc="$2"; shift 2 ;;
+				*)     ccurve="$1"; shift ;;
+			esac
+		done
+		[ -n "$ccurve" ] && uci_set fan.@fan[0].curve="$ccurve"
+		[ -n "$csrc" ]   && uci_set fan.@fan[0].src="$csrc"
+		;;
+	apply)   do_apply ;;
+	daemon)  do_daemon ;;
+	*)
+		echo "用法: $0 {status|json|sensors|auto|manual <0-100>|curve [曲线] [--src max|soc]|setcurve [曲线] [--src max|soc]|off|apply|daemon}"
+		exit 1 ;;
+esac
