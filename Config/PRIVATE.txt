@@ -71,6 +71,25 @@ CONFIG_PACKAGE_flock=y
 CONFIG_PACKAGE_coreutils=y
 CONFIG_PACKAGE_coreutils-timeout=y
 
+# ---------- iStoreOS 风格（用户指定：首页向导 + istorex + 应用商店）----------
+CONFIG_PACKAGE_luci-app-quickstart=y
+CONFIG_PACKAGE_quickstart=y
+CONFIG_PACKAGE_luci-app-istorex=y
+CONFIG_PACKAGE_luci-app-store=y
+# 依赖链（缺任一即 apk install 报错）
+CONFIG_PACKAGE_taskd=y
+CONFIG_PACKAGE_luci-lib-taskd=y
+CONFIG_PACKAGE_luci-lib-xterm=y
+CONFIG_PACKAGE_shadow-utils=y
+CONFIG_PACKAGE_shadow-useradd=y
+CONFIG_PACKAGE_mount-utils=y
+CONFIG_PACKAGE_block-mount=y
+CONFIG_PACKAGE_lsblk=y
+CONFIG_PACKAGE_e2fsprogs=y
+CONFIG_PACKAGE_parted=y
+CONFIG_PACKAGE_tar=y
+CONFIG_PACKAGE_libuci-lua=y
+
 # ---------- 后期自行装插件所需的通用依赖基础（体积可控，确保 apk add 不缺核心库）----------
 CONFIG_PACKAGE_luci-lib-base=y
 CONFIG_PACKAGE_luci-lib-ipkg=y
