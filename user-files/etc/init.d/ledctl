@@ -3,6 +3,15 @@
 START=99
 USE_PROCD=1
 
+# 板级守卫：本插件只服务 SBE1V1K，绝不在小米万兆 BE10000 上运行
+# （万兆的 RGB 是 :ambient 节点，由 luci-app-be10000 负责）。
+board_ok() {
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
+		askey,sbe1v1k|sbe1v1k) return 0 ;;
+	esac
+	return 1
+}
+
 # 硬件守卫：后端只认 /sys/class/leds/{red,green,blue}:status 三色 PWM LED。
 # 没这套节点的机型不启动守护（灯效循环是死循环，空转会白占 CPU）。
 led_hw_present() {
@@ -15,6 +24,10 @@ led_hw_present() {
 }
 
 start_service() {
+	board_ok || {
+		logger -t ledctl "not SBE1V1K, daemon skipped" 2>/dev/null || :
+		return 0
+	}
 	led_hw_present || {
 		logger -t ledctl "RGB status LED not found, daemon skipped (unsupported hardware)" 2>/dev/null || :
 		return 0
