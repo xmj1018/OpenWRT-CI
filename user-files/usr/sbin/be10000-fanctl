@@ -1,0 +1,178 @@
+#!/bin/sh
+# be10000-fanctl - Xiaomi BE10000 (IPQ9574) 智能风扇控制
+# 硬件: Microchip EMC2301/2305 I2C @0x2f, hwmon name=emc2305
+#   pwm1      0..255, 受 CONFIG_THERMAL 量化为 10 档 cooling state
+#   fan1_input 真实 RPM (芯片原生 tach)
+# 温控: 扫描全部 /sys/class/thermal/thermal_zone* 取最热
+# 策略: auto / quiet / balanced / performance 四档线性插值 + 滞回
+# 安全: 探测失败/读温失败/写入失败/堵转 -> 全速 255
+# 专属: 仅 xiaomi,be10000 / xiaomi,be10000-es, 绝不用于 SBE1V1K
+
+CONF=/etc/config/be10000
+HWMON=''
+STATUS=/var/run/be10000-fan.json
+
+log() { logger -t be10000-fan "$*" 2>/dev/null; }
+
+board_ok() {
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
+		xiaomi,be10000|xiaomi,be10000-es) return 0 ;;
+	esac
+	return 1
+}
+
+find_hwmon() {
+	[ -n "$HWMON" ] && [ -e "$HWMON/pwm1" ] && return 0
+	local d
+	for d in /sys/bus/i2c/devices/*-002f/hwmon/hwmon*; do
+		[ -r "$d/name" ] || continue
+		[ "$(cat "$d/name" 2>/dev/null)" = "emc2305" ] || continue
+		[ -e "$d/pwm1" ] || continue
+		HWMON="$d"; return 0
+	done
+	return 1
+}
+
+cfg_get() { local v; v=$(uci -q get "be10000.$1.$2" 2>/dev/null); [ -n "$v" ] && echo "$v" || echo "$3"; }
+cfg_set() { uci -q set "be10000.$1.$2=$3" && uci -q commit be10000; }
+
+# 输出: "最热milliC 传感器名 温区数 JSON列表"
+scan_temp() {
+	local hottest=-1 sensor='-' count=0 out='' first=1 z v n t
+	for z in /sys/class/thermal/thermal_zone*; do
+		[ -r "$z/temp" ] || continue
+		v=$(cat "$z/temp" 2>/dev/null)
+		case "$v" in ''|*[!0-9-]*) continue ;; esac
+		[ "$v" -ge 0 ] 2>/dev/null || continue
+		[ "$v" -le 150000 ] 2>/dev/null || continue
+		count=$((count+1))
+		n=$(cat "$z/type" 2>/dev/null | tr -cd '[:alnum:]_. -' | tr -d '\n')
+		[ -n "$n" ] || n="zone$count"
+		t=$((v/1000))
+		[ "$v" -gt "$hottest" ] && { hottest=$v; sensor="$n"; }
+		[ $first -eq 0 ] && out="$out,"
+		out="$out{\"name\":\"$n\",\"temp\":$t}"
+		first=0
+	done
+	echo "$hottest|$sensor|$count|[$out]"
+}
+
+pwm_read() { find_hwmon && cat "$HWMON/pwm1" 2>/dev/null || echo -1; }
+rpm_read() { find_hwmon && cat "$HWMON/fan1_input" 2>/dev/null || echo -1; }
+
+# EMC2305 经 thermal 框架只接受 10 档, 直接写任意值会被内核回弹
+set_pwm() {
+	local v="$1" step target
+	[ "$v" -ge 0 ] 2>/dev/null || v=255
+	[ "$v" -le 255 ] 2>/dev/null || v=255
+	if [ "$v" -gt 0 ]; then
+		step=$(( (v*10+127)/255 ))
+		[ "$step" -lt 2 ] && step=2
+	else
+		step=0
+	fi
+	target=$(( (step*255+5)/10 ))
+	find_hwmon || return 1
+	echo "$target" > "$HWMON/pwm1" 2>/dev/null || return 1
+}
+
+# start full hyst minpwm
+profile_params() {
+	case "$1" in
+		quiet)       echo "52 80 4 51" ;;
+		balanced)    echo "45 75 3 51" ;;
+		performance) echo "38 65 2 64" ;;
+		*)           echo "45 85 3 51" ;;
+	esac
+}
+
+# temp_mC active start full hyst minpwm -> 目标 0..255
+fan_target() {
+	local t="$1" act="$2" st="$3" fu="$4" hy="$5" mp="$6"
+	local s=$((st*1000)) f=$((fu*1000)) hs=$(( (st-hy)*1000 ))
+	if [ "$t" -lt "$s" ]; then
+		if [ "$act" -eq 0 ] || [ "$t" -le "$hs" ]; then echo 0; return; fi
+	fi
+	[ "$t" -ge "$f" ] && { echo 255; return; }
+	local v=$(( mp + (255-mp)*(t-s)/(f-s) ))
+	[ "$v" -lt "$mp" ] && v=$mp
+	[ "$v" -gt 255 ] && v=255
+	echo "$v"
+}
+
+do_json() {
+	find_hwmon || { echo '{"ok":false,"error":"no-emc2305"}'; return 1; }
+	local s p r pct mode profile err='' board
+	s=$(scan_temp); p=$(pwm_read); r=$(rpm_read)
+	local hot=${s%%|*}; rest=${s#*|}; sensor=${rest%%|*}; rest=${rest#*|}
+	local zones=${rest%%|*}; slist=${rest#*|}
+	local st fu hy mp; set -- $(profile_params "$(cfg_get fan profile auto)")
+	st=$1; fu=$2; hy=$3; mp=$4
+	mode=$(cfg_get fan mode auto); profile=$(cfg_get fan profile auto)
+	board=$(cat /tmp/sysinfo/board_name 2>/dev/null | tr -cd '[:alnum:],.-')
+	pct=$(( (p*100+127)/255 )); [ "$p" -lt 0 ] && pct=0
+	[ "$r" -lt 0 ] 2>/dev/null && r=-1
+	local target=255 active=0
+	[ "$p" -gt 0 ] 2>/dev/null && active=1
+	case "$mode" in
+		manual) target=$(( $(cfg_get fan manual 50)*255/100 )) ;;
+		off)    target=0 ;;
+		*)      [ "$hot" -gt 0 ] && target=$(fan_target "$hot" "$active" "$st" "$fu" "$hy" "$mp") ;;
+	esac
+	[ "$hot" -le 0 ] && err='temperature-unavailable'
+	[ "$p" -lt 0 ] && err='pwm-read-failed'
+	# 过温兜底: 任何模式下 >=75C 强制全速
+	[ "$hot" -ge 75000 ] 2>/dev/null && target=255
+	echo "{\"ok\":true,\"board\":\"$board\",\"hwmon\":\"emc2305\",\"hot\":$((hot/1000)),\"sensor\":\"$sensor\",\"zones\":$zones,\"pwm\":$p,\"pct\":$pct,\"rpm\":$r,\"target\":$target,\"mode\":\"$mode\",\"profile\":\"$profile\",\"start\":$st,\"full\":$fu,\"hyst\":$hy,\"minpwm\":$mp,\"error\":\"$err\",\"sensors\":$slist}"
+}
+
+do_status() {
+	local j; j=$(do_json)
+	echo "$j" | sed 's/,"sensors":.*/}/' | tr ',' '\n' | sed 's/[{}"]//g' | sed 's/^/  /'
+}
+
+apply_once() {
+	find_hwmon || { set -x; return 1; }
+	local s p r mode profile t st fu hy mp act hot kickfile
+	s=$(scan_temp); hot=${s%%|*}
+	p=$(pwm_read); r=$(rpm_read)
+	mode=$(cfg_get fan mode auto); profile=$(cfg_get fan profile auto)
+	set -- $(profile_params "$profile"); st=$1; fu=$2; hy=$3; mp=$4
+	act=0; [ "$p" -gt 0 ] 2>/dev/null && act=1
+	case "$mode" in
+		manual) t=$(( $(cfg_get fan manual 50)*255/100 )) ;;
+		off)    t=0 ;;
+		*)      if [ "$hot" -le 0 ]; then t=255; else t=$(fan_target "$hot" "$act" "$st" "$fu" "$hy" "$mp"); fi ;;
+	esac
+	# 堵转/未启动: 目标>0 但转速为 0 -> 全速 kick 一下
+	if [ "$t" -gt 0 ] && { [ "$p" -eq 0 ] || [ "$r" -eq 0 ] 2>/dev/null; }; then t=255; fi
+	# 过温兜底
+	[ "$hot" -ge 75000 ] 2>/dev/null && t=255
+	set_pwm "$t" || set_pwm 255
+}
+
+daemon() {
+	board_ok || { log "not a BE10000, refuse to start"; exit 0; }
+	local delay
+	while :; do
+		apply_once
+		delay=$(cfg_get fan interval 3)
+		case "$delay" in ''|*[!0-9]*) delay=3 ;; esac
+		[ "$delay" -lt 1 ] && delay=1
+		[ "$delay" -gt 30 ] && delay=30
+		do_json > "$STATUS" 2>/dev/null
+		sleep "$delay"
+	done
+}
+
+case "$1" in
+	json)    do_json ;;
+	status)  do_status ;;
+	profile) case "$2" in auto|quiet|balanced|performance) cfg_set fan profile "$2"; cfg_set fan mode auto; echo "profile=$2 mode=auto" ;; *) echo "用法: profile auto|quiet|balanced|performance"; exit 1 ;; esac ;;
+	mode)    case "$2" in auto|manual|off) cfg_set fan mode "$2"; echo "mode=$2" ;; *) echo "用法: mode auto|manual|off"; exit 1 ;; esac ;;
+	manual)  case "$2" in ''|*[!0-9]*) echo "用法: manual 0-100"; exit 1 ;; esac; [ "$2" -gt 100 ] && exit 1; cfg_set fan manual "$2"; cfg_set fan mode manual; echo "manual=$2%" ;;
+	off)     cfg_set fan mode off; echo "mode=off" ;;
+	apply)   apply_once; echo applied ;;
+	daemon)  daemon ;;
+	*) echo "用法: be10000-fanctl {json|status|profile <档>|mode <模式>|manual <0-100>|off|apply|daemon}" ;;
+esac
