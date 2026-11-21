@@ -1,0 +1,229 @@
+#!/bin/sh
+# be10000-ledctl - Xiaomi BE10000 RGB 氛围灯控制
+# 硬件: pwm-leds 三通道 /sys/class/leds/{red,green,blue}:ambient/brightness (0..255)
+# 灯效: static / breathe / duotone / rainbow / temperature / cpu / traffic
+# 专属: 仅 xiaomi,be10000 / xiaomi,be10000-es, 绝不用于 SBE1V1K(:status)
+
+CONF=/etc/config/be10000
+STATUS=/var/run/be10000-led.json
+LEDS='red green blue'
+
+log() { logger -t be10000-led "$*" 2>/dev/null; }
+
+board_ok() {
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
+		xiaomi,be10000|xiaomi,be10000-es) return 0 ;;
+	esac
+	return 1
+}
+
+led_path() { echo "/sys/class/leds/$1:ambient/brightness"; }
+leds_ok() { [ -e "$(led_path red)" ] && [ -e "$(led_path green)" ] && [ -e "$(led_path blue)" ]; }
+
+cfg_get() { local v; v=$(uci -q get "be10000.$1.$2" 2>/dev/null); [ -n "$v" ] && echo "$v" || echo "$3"; }
+cfg_set() { uci -q set "be10000.$1.$2=$3" && uci -q commit be10000; }
+
+# #RRGGBB -> "r g b"
+hexrgb() {
+	local h=$(echo "$1" | tr -d '#' | cut -c1-6)
+	case "$h" in
+		*[!0-9a-fA-F]*|'') echo "0 0 255"; return ;;
+	esac
+	local a b c
+	a=$(printf '%d' "0x$(echo "$h" | cut -c1-2)" 2>/dev/null)
+	b=$(printf '%d' "0x$(echo "$h" | cut -c3-4)" 2>/dev/null)
+	c=$(printf '%d' "0x$(echo "$h" | cut -c5-6)" 2>/dev/null)
+	case "$a" in ''|*[!0-9]*) a=0 ;; esac
+	case "$b" in ''|*[!0-9]*) b=0 ;; esac
+	case "$c" in ''|*[!0-9]*) c=0 ;; esac
+	echo "$a $b $c"
+}
+
+clamp() { local v="$1" lo="$2" hi="$3"; [ "$v" -lt "$lo" ] && v=$lo; [ "$v" -gt "$hi" ] && v=$hi; echo "$v"; }
+
+# mix r1 g1 b1 r2 g2 b2 amount(0..1000) -> "r g b"
+mix() {
+	local a="$7"
+	echo "$(( ($1*(1000-a)+$4*a)/1000 )) $(( ($2*(1000-a)+$5*a)/1000 )) $(( ($3*(1000-a)+$6*a)/1000 ))"
+}
+
+write_rgb() {
+	local r=$1 g=$2 b=$3 lv=$4
+	r=$(( (r*lv+127)/255 )); g=$(( (g*lv+127)/255 )); b=$(( (b*lv+127)/255 ))
+	r=$(clamp "$r" 0 255); g=$(clamp "$g" 0 255); b=$(clamp "$b" 0 255)
+	echo "$r" > "$(led_path red)" 2>/dev/null
+	echo "$g" > "$(led_path green)" 2>/dev/null
+	echo "$b" > "$(led_path blue)" 2>/dev/null
+}
+
+hottest_c() {
+	local z v hot=0
+	for z in /sys/class/thermal/thermal_zone*/temp; do
+		[ -r "$z" ] || continue
+		v=$(cat "$z" 2>/dev/null)
+		case "$v" in ''|*[!0-9-]*) continue ;; esac
+		[ "$v" -gt "$hot" ] && [ "$v" -le 150000 ] && hot=$v
+	done
+	echo $((hot/1000))
+}
+
+cpu_permille() {
+	local line f t idle cur prev_file=/var/run/be10000-cpu.prev
+	line=$(head -1 /proc/stat 2>/dev/null)
+	set -- $line
+	t=0; for f in $2 $3 $4 $5 $6 $7 $8 $9; do t=$((t+f)); done
+	idle=$(( $5 + $6 ))
+	cur="$t $idle"
+	prev=$(cat "$prev_file" 2>/dev/null)
+	echo "$cur" > "$prev_file"
+	[ -z "$prev" ] && { echo 0; return; }
+	set -- $prev
+	local dt=$((t-$1)) di=$((idle-$2))
+	[ "$dt" -le 0 ] && { echo 0; return; }
+	echo $(( (dt-di)*1000/dt ))
+}
+
+traffic_permille() {
+	local dev rx tx cur prev prev_file=/var/run/be10000-traffic.prev
+	dev=$(cfg_get led iface wan)
+	case "$dev" in *[!A-Za-z0-9_+.:@-]*) dev=wan ;; esac
+	rx=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null) || { echo 0; return; }
+	tx=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null) || { echo 0; return; }
+	cur="$((rx+tx)) $(date +%s)"
+	prev=$(cat "$prev_file" 2>/dev/null)
+	echo "$cur" > "$prev_file"
+	[ -z "$prev" ] && { echo 0; return; }
+	set -- $prev
+	local db=$((rx+tx-$1)) dt=$(( $(date +%s) - $2 ))
+	[ "$dt" -le 0 ] && { echo 0; return; }
+	local sens=$(cfg_get led sensitivity 5)
+	[ "$sens" -lt 1 ] && sens=1; [ "$sens" -gt 10 ] && sens=10
+	echo $(( db*1000/dt/(12500000/sens) ))
+}
+
+# 亮度(含定时/夜间) -> 0..255
+current_brightness() {
+	local en=$(cfg_get led enabled 1)
+	[ "$en" = "0" ] && { echo 0; return; }
+	local lv=$(cfg_get led brightness 96)
+	case "$lv" in ''|*[!0-9]*) lv=96 ;; esac
+	lv=$(clamp "$lv" 0 100)
+	[ "$(cfg_get led schedule 0)" = "1" ] && {
+		local now=$(date +%H%M | sed 's/^0//'); now=$(clamp "${now:-0}" 0 2400)
+		local on=$(cfg_get led on_time 07:00) off=$(cfg_get led off_time 23:30)
+		local a=$(( $(echo "$on" | cut -d: -f1)*60 + $(echo "$on" | cut -d: -f2) ))
+		local b=$(( $(echo "$off" | cut -d: -f1)*60 + $(echo "$off" | cut -d: -f2) ))
+		local m=$(( $(date +%H)*60 + $(date +%M) ))
+		if [ "$a" -ne "$b" ]; then
+			if [ "$a" -lt "$b" ]; then { [ "$m" -lt "$a" ] || [ "$m" -ge "$b" ]; } && lv=0
+			else { [ "$m" -lt "$a" ] && [ "$m" -ge "$b" ]; } && lv=0; fi
+		fi
+	}
+	[ "$(cfg_get led night 0)" = "1" ] && [ "$lv" -gt 0 ] && {
+		local ns=$(cfg_get led night_start 22:00) ne=$(cfg_get led night_end 07:00)
+		local a=$(( $(echo "$ns" | cut -d: -f1)*60 + $(echo "$ns" | cut -d: -f2) ))
+		local b=$(( $(echo "$ne" | cut -d: -f1)*60 + $(echo "$ne" | cut -d: -f2) ))
+		local m=$(( $(date +%H)*60 + $(date +%M) )) nl=$(cfg_get led night_brightness 24)
+		local inw=0
+		if [ "$a" -lt "$b" ]; then { [ "$m" -ge "$a" ] && [ "$m" -lt "$b" ]; } && inw=1
+		else { [ "$m" -ge "$a" ] || [ "$m" -lt "$b" ]; } && inw=1; fi
+		[ "$inw" = "1" ] && [ "$nl" -lt "$lv" ] && lv=$nl
+	}
+	# 配置是 0..100 百分比，写入 LED 前换算到 0..255
+	echo $(( lv*255/100 ))
+}
+
+do_json() {
+	leds_ok || { echo '{"ok":false,"error":"no-ambient-leds"}'; return 1; }
+	local r g b en mode color second lv speed
+	r=$(cat "$(led_path red)" 2>/dev/null || echo 0)
+	g=$(cat "$(led_path green)" 2>/dev/null || echo 0)
+	b=$(cat "$(led_path blue)" 2>/dev/null || echo 0)
+	en=$(cfg_get led enabled 1); mode=$(cfg_get led mode breathe)
+	color=$(cfg_get led color '#0000ff'); second=$(cfg_get led second '#ff00aa')
+	lv=$(cfg_get led brightness 96); speed=$(cfg_get led speed 5)
+	echo "{\"ok\":true,\"enabled\":\"$en\",\"mode\":\"$mode\",\"color\":\"$color\",\"second\":\"$second\",\"brightness\":$lv,\"speed\":$speed,\"actual\":\"#$(printf '%02x%02x%02x' "$r" "$g" "$b")\",\"r\":$r,\"g\":$g,\"b\":$b}"
+}
+
+render() {
+	local lv=$(current_brightness)
+	local mode=$(cfg_get led mode breathe) speed=$(cfg_get led speed 5)
+	local c1 c2 rgb amount phase="$1"
+	case "$speed" in ''|*[!0-9]*) speed=5 ;; esac
+	speed=$(clamp "$speed" 1 10)
+	amount=$phase; [ "$phase" -gt 1000 ] && amount=$((2000-phase))
+	c1=$(hexrgb "$(cfg_get led color '#0000ff')")
+	c2=$(hexrgb "$(cfg_get led second '#ff00aa')")
+	set -- $c1; local r1=$1 g1=$2 b1=$3
+	set -- $c2; local r2=$1 g2=$2 b2=$3
+	[ "$lv" -gt 0 ] && case "$mode" in
+		breathe)
+			local mn=$(cfg_get led minimum 8)
+			case "$mn" in ''|*[!0-9]*) mn=8 ;; esac
+			mn=$(( $(clamp "$mn" 0 100)*255/100 ))
+			[ "$mn" -gt "$lv" ] && mn=$lv
+			lv=$(( mn + (lv-mn)*amount/1000 )) ;;
+		duotone)
+			set -- $(mix "$r1" "$g1" "$b1" "$r2" "$g2" "$b2" "$amount"); r1=$1; g1=$2; b1=$3 ;;
+		rainbow)
+			# 色轮 7 个锚点，phase 0..1999 映射到 6 段，段内线性插值
+			local pos=$((phase*6)) seg=$((pos/2000)) am=$(( (pos%2000)*1000/2000 ))
+			local vr=255 vg=0 vb=0 br=255 bg=0 bb=0
+			case "$seg" in
+				0) vr=255; vg=0;   vb=0;   br=255; bg=255; bb=0   ;;
+				1) vr=255; vg=255; vb=0;   br=0;   bg=255; bb=0   ;;
+				2) vr=0;   vg=255; vb=0;   br=0;   bg=255; bb=255 ;;
+				3) vr=0;   vg=255; vb=255; br=0;   bg=0;   bb=255 ;;
+				4) vr=0;   vg=0;   vb=255; br=255; bg=0;   bb=255 ;;
+				5) vr=255; vg=0;   vb=255; br=255; bg=0;   bb=0   ;;
+			esac
+			set -- $(mix "$vr" "$vg" "$vb" "$br" "$bg" "$bb" "$am"); r1=$1; g1=$2; b1=$3 ;;
+		temperature)
+			local t=$(hottest_c) s=$(cfg_get led sensitivity 5)
+			t=$(( t + (s-5)*2 ))
+			if [ "$t" -le 55 ]; then set -- $(mix 0 255 80 255 128 0 $(( (t-35)*50 )))
+			else set -- $(mix 255 128 0 255 0 0 $(( (t-55)*50 ))); fi
+			r1=$1; g1=$2; b1=$3 ;;
+		cpu|traffic)
+			local u; [ "$mode" = cpu ] && u=$(cpu_permille) || u=$(traffic_permille)
+			u=$(( u*(50+$(cfg_get led sensitivity 5)*10)/100 ))
+			u=$(clamp "$u" 0 1000)
+			if [ "$u" -le 500 ]; then set -- $(mix 0 180 80 255 180 0 $((u*2)))
+			else set -- $(mix 255 180 0 255 0 0 $(( (u-500)*2 ))); fi
+			r1=$1; g1=$2; b1=$3 ;;
+	esac
+	[ "$lv" -eq 0 ] && { r1=0; g1=0; b1=0; }
+	write_rgb "$r1" "$g1" "$b1" "$lv"
+}
+
+daemon() {
+	board_ok || { log "not a BE10000, refuse to start"; exit 0; }
+	leds_ok || { log "no :ambient LEDs, refuse to start"; exit 0; }
+	for l in $LEDS; do echo none > "/sys/class/leds/$l:ambient/trigger" 2>/dev/null; done
+	local phase=0 fine=0.1 mode
+	sleep 0.1 2>/dev/null || fine=1
+	while :; do
+		render "$phase"
+		mode=$(cfg_get led mode breathe)
+		case "$mode" in static|temperature|cpu|traffic) sleep 1 ;; *) sleep "$fine" ;; esac
+		phase=$(( phase + $(cfg_get led speed 5)*4 ))
+		[ "$phase" -ge 2000 ] && phase=0
+		do_json > "$STATUS" 2>/dev/null
+	done
+}
+
+case "$1" in
+	json)    do_json ;;
+	mode)    case "$2" in static|breathe|duotone|rainbow|temperature|cpu|traffic) cfg_set led mode "$2"; echo "mode=$2" ;; *) echo "用法: mode static|breathe|duotone|rainbow|temperature|cpu|traffic"; exit 1 ;; esac ;;
+	color)   case "$2" in \#??????) cfg_set led color "$2"; echo "color=$2" ;; *) echo "用法: color #RRGGBB"; exit 1 ;; esac ;;
+	second)  case "$2" in \#??????) cfg_set led second "$2"; echo "second=$2" ;; *) echo "用法: second #RRGGBB"; exit 1 ;; esac ;;
+	brightness) case "$2" in ''|*[!0-9]*) echo "用法: brightness 0-100"; exit 1 ;; esac; cfg_set led brightness "$(clamp "$2" 0 100)"; echo "brightness=$2" ;;
+	minimum) cfg_set led minimum "$(clamp "$2" 0 100)"; echo "minimum=$2" ;;
+	speed)   cfg_set led speed "$(clamp "$2" 1 10)"; echo "speed=$2" ;;
+	enabled) cfg_set led enabled "$2"; echo "enabled=$2" ;;
+	off)     cfg_set led enabled 0; echo disabled ;;
+	on)      cfg_set led enabled 1; echo enabled ;;
+	apply)   render 0; echo applied ;;
+	daemon)  daemon ;;
+	*) echo "用法: be10000-ledctl {json|mode <灯效>|color <#RRGGBB>|brightness <0-100>|speed <1-10>|enabled 0|1|on|off|apply|daemon}" ;;
+esac
