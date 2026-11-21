@@ -16,8 +16,8 @@ jobs:
     with:
       WRT_CONFIG: IPQ95XX
       WRT_THEME: argon
-      # 主机名设为 immortalwrt（左上角品牌另由 Settings 补丁处理）
-      WRT_NAME: immortalwrt
+      # 主机名设为官方大小写 ImmortalWRT（argon 左上角/登录页品牌字取此值）
+      WRT_NAME: ImmortalWRT
       WRT_SSID: OWRT
       WRT_WORD: 12345678
       WRT_IP: 192.168.10.1
