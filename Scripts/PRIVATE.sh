@@ -1,14 +1,21 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 # 自定义插件源扩展脚本（由官方 Scripts/Packages.sh 末尾自动 source）
-# 小米万兆 BE10000 精简版：严格复刻官方可启动基线，只加 honk + OAF + iStoreOS 风格
+# IPQ95XX 精简版：严格复刻官方可启动基线，只加 honk + OAF + iStoreOS 风格
 # + HomeProxyRE(1andrevich/homeproxy-hiddify) + Argon 默认主题 + 315 字体排版(T 折行)
-# + 内置新版「风扇控制 / RGB 状态灯」界面插件(luci-app-sbehw)。
-# 旧版 OW 自带的风扇/LED 界面、LED 触发器、pwmfan 模块加载项全部移除。
+# + 【两个机型专属插件同时内置】luci-app-sbe1v1k + luci-app-be10000。
+#
+# 一次 CI 会输出 IPQ95XX.txt 里全部机型镜像，files/ 覆盖对所有机型生效，
+# 无法按机型拆文件。因此两个插件一起铺进 rootfs，两者路径零重叠，且各自的
+# init 都带 board_name + 硬件节点双重守卫：
+#   * askey,sbe1v1k    -> fanctl / ledctl 生效，be10000-* 自动跳过
+#   * xiaomi,be10000   -> be10000-fan / be10000-led 生效，fanctl / ledctl 自动跳过
+# 非本机不会启动守护、不空转、不抢内核风扇控制权；界面显示「未检测到」。
+# 旧版 OW 自带风扇/LED 界面、LED 触发器、pwmfan 模块加载项、旧 sbehw 全部移除。
 # 不加 Docker / emmc-health / 36 插件全集 —— 控制体积确保能启动。
 
 echo " "
-echo "========== Load PRIVATE.sh (xiaomi_be10000 lite) =========="
+echo "========== Load PRIVATE.sh (IPQ95XX lite, both hwctrl plugins) =========="
 
 # ---------------- honk（用户指定：kenzok8/openwrt-honk）----------------
 rm -rf ./package/honk ./package/luci-app-honk ./package/doona ./package/luci-app-doona 2>/dev/null
@@ -36,32 +43,40 @@ UPDATE_PACKAGE "luci-app-argon-config" "kenzok8/openwrt-packages" "master" "pkg"
 # ---------------- HomeProxy（用户指定：1andrevich/homeproxy-hiddify）----------------
 UPDATE_PACKAGE "luci-app-re-homeproxy" "1andrevich/homeproxy-hiddify" "master" "" "luci-app-homeproxy"
 
-# ---------------- 自定义文件覆盖（315 字体/模板 + 新版风扇/RGB 插件）----------------
+# ---------------- 自定义文件覆盖（315 字体/模板 + 两个机型专属 hwctrl 插件）----------------
 if [ -d "$GITHUB_WORKSPACE/user-files" ]; then
   mkdir -p ./files
   cp -af "$GITHUB_WORKSPACE/user-files/." ./files/
 
   # GitHub REST API 上传的文件一律 100644，会丢可执行位。
-  # 后端脚本 + init 必须补回 755，否则界面 exec 全失败、守护起不来。
-  chmod 755 ./files/usr/sbin/fanctl ./files/usr/sbin/ledctl \
-            ./files/etc/init.d/fanctl ./files/etc/init.d/ledctl 2>/dev/null || :
+  # 后端脚本、init、uci-defaults 必须补回 755，否则界面 exec 全失败、守护起不来。
+  chmod 755 \
+    ./files/usr/sbin/fanctl ./files/usr/sbin/ledctl \
+    ./files/usr/sbin/be10000-fanctl ./files/usr/sbin/be10000-ledctl \
+    ./files/etc/init.d/fanctl ./files/etc/init.d/ledctl \
+    ./files/etc/init.d/be10000-fan ./files/etc/init.d/be10000-led \
+    ./files/usr/lib/sbe1v1k/fanctl ./files/usr/lib/sbe1v1k/ledctl \
+    ./files/usr/lib/sbe1v1k/init.fanctl ./files/usr/lib/sbe1v1k/init.ledctl \
+    ./files/etc/uci-defaults/99-hwctrl-enable 2>/dev/null || :
 
-  # 双保险：清除上一版 SBE 全插件编译遗留的旧风扇/RGB 文件。
-  # 这些是「OW 自带」的旧界面/旧菜单/LED 触发器/pwmfan 模块项，
-  # 万兆不需要且与新菜单重复；即便远程 user-files 删漏了，这里也清干净。
+  # 双保险：清除上一版编译遗留的旧风扇/RGB / 旧 sbehw 文件。
+  # 远程 user-files 是全仓库共用的，切配置时残留会被整包卷进新固件。
   rm -f ./files/usr/share/luci/menu.d/luci-app-fan.json \
         ./files/usr/share/luci/menu.d/luci-app-led.json \
+        ./files/usr/share/luci/menu.d/luci-app-sbehw.json \
         ./files/usr/share/rpcd/acl.d/luci-app-fan.json \
         ./files/usr/share/rpcd/acl.d/luci-app-led.json \
+        ./files/usr/share/rpcd/acl.d/luci-app-sbehw.json \
         ./files/www/luci-static/resources/view/system/fan.js \
         ./files/www/luci-static/resources/view/system/led.js \
         ./files/etc/board.d/01_leds \
         ./files/etc/modules.d/60-hwmon-pwmfan \
         ./files/lib/functions/leds.sh \
         ./files/sbin/led.sh 2>/dev/null || :
-  rm -rf ./files/www/luci-static/resources/view/system/led-trigger 2>/dev/null || :
+  rm -rf ./files/www/luci-static/resources/view/system/led-trigger \
+         ./files/www/luci-static/resources/view/sbehw 2>/dev/null || :
 
-  echo "315 fonts/templates + sbehw overlaid: $(find ./files -type f | wc -l) files"
+  echo "315 fonts/templates + sbe1v1k + be10000 overlaid: $(find ./files -type f | wc -l) files"
 else
   echo "WARN: user-files not found, skip overlay"
 fi
