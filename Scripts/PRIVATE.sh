@@ -20,11 +20,11 @@ UPDATE_PACKAGE "luci-app-honk" "kenzok8/openwrt-honk" "main" "pkg"
 UPDATE_PACKAGE "v2ray-geodata" "kenzok8/small" "master" "" "v2ray-geoip v2ray-geosite"
 
 # ---------------- OAF（应用过滤，用户指定）----------------
-UPDATE_PACKAGE "OpenAppFilter" "destan19/OpenAppFilter" "master" "" "luci-app-oaf oaf open-app-filter appfilter"
-# 若 destan19 源不含独立 luci-app-oaf 界面，用 kenzok8/jell 版本补充
-if [ ! -d "./package/luci-app-oaf" ]; then
-  UPDATE_PACKAGE "luci-app-oaf" "kenzok8/jell" "main" "pkg"
-fi
+# destan19/OpenAppFilter 自带完整一套：appfilter(服务) + oaf(内核模块) + luci-app-oaf(界面)。
+# 用官方推荐的 open-app-filter 写法整仓克隆，清理 feeds 里同名旧组件。
+# 注意：切勿再从 kenzok8/jell 克隆 luci-app-oaf —— 两个源的界面都提供
+# usr/share/rpcd/acl.d/luci-app-oaf.json，apk 安装会报 "trying to overwrite" 冲突。
+UPDATE_PACKAGE "open-app-filter" "destan19/OpenAppFilter" "master" "" "luci-app-appfilter oaf"
 
 # ---------------- kenzok8/jell 聚合源中的冷门插件（pkg 提取）----------------
 # 这些插件官方源没有，从 jell 大杂烩按包名单独提取。
@@ -64,8 +64,12 @@ UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main" "" "luci-app-quickf
 UPDATE_PACKAGE "portweaver" "LazuliKao/openwrt-portweaver" "main" "pkg" "luci-app-portweaver"
 # zapret2（DPI 绕过）
 UPDATE_PACKAGE "zapret2" "damocjwj/openwrt-zapret2" "main" "pkg" "luci-app-zapret2"
-# re-homeproxy（homeproxy 重写版）
-UPDATE_PACKAGE "luci-app-re-homeproxy" "1andrevich/homeproxy-hiddify" "master" "" "luci-app-homeproxy"
+# re-homeproxy（homeproxy 重写版）：已移除。
+# 官方 GENERAL.txt 已含 CONFIG_PACKAGE_luci-app-homeproxy=y，官方源自带 homeproxy；
+# 再装 hiddify 重写版会与官方 luci-app-homeproxy / luci-i18n-homeproxy-zh-cn
+# 争抢 etc/homeproxy/* 和 www/luci-static/resources/homeproxy* 等文件，apk 报
+# "trying to overwrite ... owned by luci-app-homeproxy" 冲突。保留官方版即可。
+# UPDATE_PACKAGE "luci-app-re-homeproxy" "1andrevich/homeproxy-hiddify" "master" "" "luci-app-homeproxy"
 
 # ---------------- 品牌定制：左上角 owrt -> immortalwrt ----------------
 # 说明：workflow 已把 WRT_NAME=immortalwrt，Settings.sh 会写 hostname='immortalwrt'。
