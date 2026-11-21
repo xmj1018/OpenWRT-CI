@@ -81,7 +81,8 @@ CONFIG_PACKAGE_luci-app-portweaver=y
 CONFIG_PACKAGE_luci-app-qosify=y
 CONFIG_PACKAGE_luci-app-quickfile=y
 CONFIG_PACKAGE_luci-app-quickstart=y
-CONFIG_PACKAGE_luci-app-re-homeproxy=y
+# luci-app-re-homeproxy 已移除：官方 GENERAL.txt 自带 luci-app-homeproxy，
+# hiddify 重写版会与其抢 etc/homeproxy/* 文件导致 apk install 冲突。保留官方版。
 CONFIG_PACKAGE_luci-app-samba4=y
 CONFIG_PACKAGE_luci-app-shadowrt=y
 CONFIG_PACKAGE_luci-app-sqm=y
@@ -99,8 +100,10 @@ CONFIG_PACKAGE_docker=y
 CONFIG_PACKAGE_dockerd=y
 CONFIG_PACKAGE_luci-lib-docker=y
 CONFIG_PACKAGE_lxc=y
+# OAF 用 destan19/OpenAppFilter 一整套（appfilter 服务 + oaf 模块 + luci-app-oaf 界面）
+# luci-app-oaf 已在上方插件列表选中，此处只补主程序和模块。
 CONFIG_PACKAGE_appfilter=y
-CONFIG_PACKAGE_kmod-oaf=y
+CONFIG_PACKAGE_oaf=y
 CONFIG_PACKAGE_luci-compat=y
 CONFIG_PACKAGE_coreutils-lsblk=y
 CONFIG_PACKAGE_zapret2=y
