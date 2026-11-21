@@ -25,6 +25,13 @@ UPDATE_PACKAGE "v2ray-geodata" "kenzok8/small" "master" "" "v2ray-geoip v2ray-ge
 # usr/share/rpcd/acl.d/luci-app-oaf.json，apk 安装会报 "trying to overwrite" 冲突。
 UPDATE_PACKAGE "open-app-filter" "destan19/OpenAppFilter" "master" "" "luci-app-appfilter oaf"
 
+# ---------------- iStoreOS 风格（用户指定：quickstart 首页向导 + istorex + store）----------------
+# 依赖链：luci-app-quickstart→quickstart/luci-app-store；luci-app-istorex→luci-lib-taskd；
+# luci-app-store→luci-lib-taskd；luci-lib-taskd→luci-lib-xterm+taskd。全部从 kenzok8/openwrt-packages 克隆。
+for PKG in quickstart luci-app-quickstart istorex luci-app-istorex luci-app-store taskd luci-lib-taskd luci-lib-xterm; do
+  UPDATE_PACKAGE "$PKG" "kenzok8/openwrt-packages" "master" "pkg"
+done
+
 # ---------------- Argon 主题（用户指定，设为默认）----------------
 # kenzok8/openwrt-packages 的 argon 为新版（依赖 ucode-mod-math），适配 owrt 分支。
 # 先清理 feeds 自带旧 argon，再从该源提取主题 + 配置包。
