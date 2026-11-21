@@ -1,0 +1,26 @@
+#!/bin/sh
+# 首次开机启用两个机型专属硬件控制守护。
+# 两个 init 内都带 board_name + 硬件节点双重守卫：
+#   - xiaomi,be10000        -> be10000-fan / be10000-led 生效，fanctl/ledctl 自动跳过
+#   - askey,sbe1v1k         -> fanctl / ledctl 生效，be10000-* 自动跳过
+# 因此把两套插件同时内置到所有机型镜像里是安全的，不会抢内核风扇控制权。
+
+for s in fanctl ledctl be10000-fan be10000-led; do
+	[ -x "/etc/init.d/$s" ] || continue
+	"/etc/init.d/$s" enable >/dev/null 2>&1 || :
+done
+
+# 固件若自带旧版风扇/RGB 综合界面，禁用其菜单，避免两套控制抢同一硬件。
+# 只改名不删除，随时可恢复。
+for f in /usr/share/luci/menu.d/luci-app-fan.json \
+         /usr/share/luci/menu.d/luci-app-led.json \
+         /usr/share/luci/menu.d/luci-app-sbehw.json \
+         /usr/share/luci/menu.d/luci-app-xiaomi-control.json; do
+	[ -f "$f" ] && mv "$f" "$f.disabled-by-hwctrl" 2>/dev/null || :
+done
+
+# 让新装的菜单 / ACL 立刻被 LuCI 与 rpcd 识别
+rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || :
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart >/dev/null 2>&1 || :
+
+exit 0
