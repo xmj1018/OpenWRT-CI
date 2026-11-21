@@ -66,9 +66,20 @@ else
   echo "WARN: user-files not found, skip overlay"
 fi
 
-# ---------------- 品牌定制：统一 ImmortalWRT ----------------
-CFG_GEN="./package/base-files/files/bin/config_generate"
-[ -f "$CFG_GEN" ] && sed -i "s/hostname='.*'/hostname='ImmortalWRT'/g; s/description='.*'/description='ImmortalWRT'/g" "$CFG_GEN"
-grep -rl -E 'ImmortalWrt|OpenWrt|OWRT' ./feeds/luci/modules/luci-base/htdocs/luci-static/resources/ ./package/emortal/luci-app-router-tool/ 2>/dev/null | xargs -r sed -i 's/ImmortalWrt/ImmortalWRT/g; s/OpenWrt/ImmortalWRT/g; s/OWRT/ImmortalWRT/g'
+# ---------------- 品牌 / 无线 / SSID / 密码 / 后台地址：全部保持上游默认 ----------------
+# 本脚本【不修改任何上游源码文件】，完全照抄 VIKINGYFY/immortalwrt 的默认：
+#   * 主机名 / 左上角 / 登录页品牌：由官方 Settings.sh 按 WRT_NAME=ImmortalWRT 设置，
+#     315 字体模板(header.ut / sysauth.ut)负责折行排版与字体，页脚作者已删。
+#   * 无线：wifi-scripts 生成器输出 wifi-iface disabled='0'（默认开启）。
+#   * SSID / 密码：luci-app-router-tool 初始化为
+#     OWRT-2.4G / OWRT-5.2G / OWRT-5.8G + 12345678。
+#   * 后台地址：官方 Settings.sh 按 WRT_IP 设为 192.168.10.1。
+#
+# 【OWRT 是字面量，严禁替换成 ImmortalWRT】
+# 上游 luci-app-router-tool 靠 wireless.uc 里的 "iface.ssid != 'OWRT'" 判断
+# 「未被修改过的默认 AP」；只有匹配才会执行初始化。上一版在这里对
+# ./package/emortal/luci-app-router-tool/ 做了全局替换，把判断改成
+# 'ImmortalWRT'，导致 router-tool 跳过初始化、无线默认失效 —— 已彻底撤销。
+# 用户强调：是 OWRT，不是 OpenWrt。四个字母，一个都不能改。
 
 echo "========== PRIVATE.sh done =========="
