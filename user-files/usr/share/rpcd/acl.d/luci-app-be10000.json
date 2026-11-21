@@ -1,0 +1,17 @@
+{
+	"luci-app-be10000": {
+		"description": "Xiaomi BE10000 (EMC2305 fan + :ambient RGB LED) control",
+		"read": {
+			"file": {
+				"/usr/sbin/be10000-fanctl": [ "exec" ],
+				"/usr/sbin/be10000-ledctl": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/be10000-fanctl": [ "exec" ],
+				"/usr/sbin/be10000-ledctl": [ "exec" ]
+			}
+		}
+	}
+}
