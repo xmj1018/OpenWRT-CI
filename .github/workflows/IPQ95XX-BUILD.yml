@@ -15,7 +15,7 @@ jobs:
     uses: ./.github/workflows/WRT-CORE.yml
     with:
       WRT_CONFIG: IPQ95XX
-      WRT_THEME: vantage
+      WRT_THEME: argon
       # 主机名设为 immortalwrt（左上角品牌另由 Settings 补丁处理）
       WRT_NAME: immortalwrt
       WRT_SSID: OWRT
