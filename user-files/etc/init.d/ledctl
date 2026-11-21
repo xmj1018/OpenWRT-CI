@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	config_load led
+	config_get mode led mode static
+	config_get en   led enabled 1
+
+	# 先按保存的配置落一次硬件（static 立即生效，灯效交给守护）
+	[ -n "$LED_SKIP_APPLY" ] || LED_NO_DAEMON=1 /usr/sbin/ledctl apply >/dev/null 2>&1
+
+	procd_open_instance
+	procd_set_param command /usr/sbin/ledctl daemon
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+}
+
+stop_service() {
+	:
+}
