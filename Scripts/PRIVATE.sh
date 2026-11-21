@@ -38,10 +38,11 @@ done
 UPDATE_PACKAGE "luci-theme-argon" "kenzok8/openwrt-packages" "master" "pkg" "luci-theme-argon luci-app-argon-config"
 UPDATE_PACKAGE "luci-app-argon-config" "kenzok8/openwrt-packages" "master" "pkg"
 
-# ---------------- 品牌定制：登录页 + 左上角统一显示 immortalwrt ----------------
-# hostname 由 Settings.sh 依 WRT_NAME=immortalwrt 写入；这里补 description 与 LuCI 显示字符串（纯 sed，不增体积）。
+# ---------------- 品牌定制：登录页 + 左上角统一显示 ImmortalWRT（官方大小写）----------------
+# hostname 由 Settings.sh 依 WRT_NAME=ImmortalWRT 写入；argon 品牌字取 ubus system.board 的 hostname。
+# 这里补 description 与 LuCI 显示字符串为官方大小写（纯 sed，不增体积）。
 CFG_GEN="./package/base-files/files/bin/config_generate"
-[ -f "$CFG_GEN" ] && sed -i "s/hostname='.*'/hostname='immortalwrt'/g; s/description='.*'/description='immortalwrt'/g" "$CFG_GEN"
-grep -rl -E 'ImmortalWrt|OpenWrt|OWRT' ./feeds/luci/modules/luci-base/htdocs/luci-static/resources/ ./package/emortal/luci-app-router-tool/ 2>/dev/null | xargs -r sed -i 's/ImmortalWrt/immortalwrt/g; s/OpenWrt/immortalwrt/g; s/OWRT/immortalwrt/g'
+[ -f "$CFG_GEN" ] && sed -i "s/hostname='.*'/hostname='ImmortalWRT'/g; s/description='.*'/description='ImmortalWRT'/g" "$CFG_GEN"
+grep -rl -E 'ImmortalWrt|OpenWrt|OWRT' ./feeds/luci/modules/luci-base/htdocs/luci-static/resources/ ./package/emortal/luci-app-router-tool/ 2>/dev/null | xargs -r sed -i 's/ImmortalWrt/ImmortalWRT/g; s/OpenWrt/ImmortalWRT/g; s/OWRT/ImmortalWRT/g'
 
 echo "========== PRIVATE.sh done =========="
