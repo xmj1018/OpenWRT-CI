@@ -43,6 +43,10 @@ done
 # 该源 luci-lib-taskd 版本 1.0.26，满足 istorex>=1.0.15 / store>=1.0.19 约束。
 # iname "taskd" 会同时抓到 taskd 和 luci-lib-taskd 两个目录。
 UPDATE_PACKAGE "taskd" "kenzok8/openwrt-packages" "master" "pkg"
+# luci-lib-taskd 依赖 luci-lib-xterm，但 iname "*taskd*" 匹配不到它，
+# 需单独克隆（同源 kenzok8/openwrt-packages），否则 apk install 阶段报
+# "luci-lib-xterm (no such package) required by luci-lib-taskd"。
+UPDATE_PACKAGE "luci-lib-xterm" "kenzok8/openwrt-packages" "master" "pkg"
 
 
 # ---------------- istorex / quickstart / store / quickfile ----------------
