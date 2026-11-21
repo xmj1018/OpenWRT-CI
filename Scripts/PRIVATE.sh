@@ -1,16 +1,16 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 # 自定义插件源扩展脚本（由官方 Scripts/Packages.sh 末尾自动 source）
-# 目标：VIKINGYFY/immortalwrt owrt 分支 + qualcommbe/ipq95xx（含 askey_sbe1v1k / xiaomi_be10000）
-# 全插件版（SBE1V1K 8GB eMMC，体积不限）：恢复最初 36 插件全集 + Docker + emmc-health
-# + HomeProxy(1andrevich/homeproxy-hiddify) + 风扇/LED 控制 + 315 字体排版，依赖全配齐。
-# 说明：UPDATE_PACKAGE "包名" "项目地址" "分支" "pkg(可选,从大杂烩提取)" "需清理的同名包(可选)"
+# 小米万兆 BE10000 精简版：严格复刻官方可启动基线，只加 honk + OAF + iStoreOS 风格
+# + HomeProxyRE(1andrevich/homeproxy-hiddify) + Argon 默认主题 + 315 字体排版(T 折行)
+# + 内置新版「风扇控制 / RGB 状态灯」界面插件(luci-app-sbehw)。
+# 旧版 OW 自带的风扇/LED 界面、LED 触发器、pwmfan 模块加载项全部移除。
+# 不加 Docker / emmc-health / 36 插件全集 —— 控制体积确保能启动。
 
 echo " "
-echo "========== Load PRIVATE.sh (custom packages) =========="
+echo "========== Load PRIVATE.sh (xiaomi_be10000 lite) =========="
 
 # ---------------- honk（用户指定：kenzok8/openwrt-honk）----------------
-# 清理官方 doona-feed 旧包，避免与 kenzok8 版冲突
 rm -rf ./package/honk ./package/luci-app-honk ./package/doona ./package/luci-app-doona 2>/dev/null
 find ./feeds -maxdepth 4 -type d \( -iname "honk" -o -iname "luci-app-honk" -o -iname "doona" -o -iname "luci-app-doona" \) -exec rm -rf {} + 2>/dev/null
 UPDATE_PACKAGE "honk" "kenzok8/openwrt-honk" "main" "pkg" "luci-app-honk honk doona luci-app-doona"
@@ -19,78 +19,54 @@ UPDATE_PACKAGE "luci-app-honk" "kenzok8/openwrt-honk" "main" "pkg"
 # v2ray GeoIP / GeoSite（honk 路由数据依赖）
 UPDATE_PACKAGE "v2ray-geodata" "kenzok8/small" "master" "" "v2ray-geoip v2ray-geosite"
 
-# ---------------- OAF（应用过滤）----------------
-# destan19/OpenAppFilter 同源一整套（appfilter 7.0.2 + oaf + luci-app-oaf 7.0-r2 + kmod-oaf）版本配套。
-# 关键：不要再单独克隆 kenzok8/jell 的 luci-app-oaf —— 那个版本是 0，会和 appfilter 7.0.2
-# 同时提供 usr/share/rpcd/acl.d/luci-app-oaf.json 导致打包 trying to overwrite 失败。
+# ---------------- OAF（应用过滤，destan19 同源一整套版本配套）----------------
+# 不要额外克隆 kenzok8/jell 的 luci-app-oaf(版本0)，它和 appfilter 7.0.2 都提供
+# usr/share/rpcd/acl.d/luci-app-oaf.json，会 trying to overwrite 导致打包失败。
 UPDATE_PACKAGE "open-app-filter" "destan19/OpenAppFilter" "master" "" "luci-app-appfilter oaf open-app-filter"
 
-# ---------------- iStoreOS 风格 ----------------
-# 依赖链：luci-app-quickstart→quickstart/luci-app-store；istorex/store→luci-lib-taskd；
-# luci-lib-taskd→luci-lib-xterm+taskd。全部同源 kenzok8/openwrt-packages 保版本一致。
+# ---------------- iStoreOS 风格（同源保版本一致）----------------
 for PKG in quickstart luci-app-quickstart luci-app-istorex luci-app-store taskd luci-lib-taskd luci-lib-xterm; do
   UPDATE_PACKAGE "$PKG" "kenzok8/openwrt-packages" "master" "pkg"
 done
 
-# ---------------- Argon 主题（默认）----------------
+# ---------------- Argon 主题 ----------------
 UPDATE_PACKAGE "luci-theme-argon" "kenzok8/openwrt-packages" "master" "pkg" "luci-theme-argon luci-app-argon-config"
 UPDATE_PACKAGE "luci-app-argon-config" "kenzok8/openwrt-packages" "master" "pkg"
 
-# ---------------- kenzok8/jell 聚合源中的冷门插件 ----------------
-# 关键：pkg 模式用 iname "*<名>*" 模糊匹配。用主程序名可同时抓到界面+主程序，
-# 避免 apk install 报 "<主程序> (no such package)"。
-#   bandix -> luci-app-bandix + openwrt-bandix
-#   unishare -> luci-app-unishare + unishare (+ webdav2 传递依赖)
-for PKG in bandix unishare docker-lan-bridge webdav2 \
-           luci-app-cpu-perf luci-app-cpu-status \
-           luci-app-shadowrt luci-app-temp-status \
-           luci-app-nikki luci-app-mosdns luci-app-passwall; do
-  UPDATE_PACKAGE "$PKG" "kenzok8/jell" "main" "pkg"
-done
-# taskd/luci-lib-taskd 同源 openwrt-packages（版本 1.0.26 满足约束），iname "taskd" 两个都抓
-UPDATE_PACKAGE "taskd" "kenzok8/openwrt-packages" "master" "pkg"
-
-# ---------------- 单独源插件 ----------------
-UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main" "" "luci-app-quickfile quickfile"
-UPDATE_PACKAGE "portweaver" "LazuliKao/openwrt-portweaver" "main" "pkg" "luci-app-portweaver"
-UPDATE_PACKAGE "zapret2" "damocjwj/openwrt-zapret2" "main" "pkg" "luci-app-zapret2"
+# ---------------- HomeProxy（用户指定：1andrevich/homeproxy-hiddify）----------------
 UPDATE_PACKAGE "luci-app-re-homeproxy" "1andrevich/homeproxy-hiddify" "master" "" "luci-app-homeproxy"
 
-# ---------------- eMMC 健康（用户指定加回）----------------
-# 克隆到 ./package/eMMC-Health（仓库名即目录名），Makefile 写死依赖 luci-js-deps，
-# 而 owrt 分支 luci 源无此包（上次编译失败唯一根因）。该插件 JS 仅用 luci-base 自带组件，
-# 不真正依赖它 —— 克隆后 sed 掉该依赖，即可正常编译安装（这也是社区通行做法）。
-UPDATE_PACKAGE "luci-app-emmc-health" "adminchenyu/eMMC-Health" "main"
-EMMC_MK="./package/eMMC-Health/Makefile"
-if [ -f "$EMMC_MK" ]; then
-  sed -i 's/+luci-js-deps//g' "$EMMC_MK"
-  echo "patched eMMC-Health Makefile: removed luci-js-deps"
-else
-  echo "WARN: $EMMC_MK not found; try alternative path"
-  find ./package -maxdepth 3 -iname "Makefile" -path "*eMMC*" -exec sed -i 's/+luci-js-deps//g' {} \; 2>/dev/null
-fi
-
-# ---------------- Docker 一整套（用户要求：这次加回 Docker）----------------
-# owrt 分支自带 docker/dockerd/luci-app-dockerman/luci-lib-docker，
-# 若 feeds 里缺 luci-app-dockerman 则补一个第三方源，避免 CONFIG=y 却无包可编。
-if ! find ./feeds -maxdepth 4 -type d -iname "luci-app-dockerman" 2>/dev/null | grep -q .; then
-  UPDATE_PACKAGE "luci-app-dockerman" "kenzok8/jell" "main" "pkg"
-fi
-
-# ---------------- 自定义文件覆盖（风扇/LED 插件 + 315 字体排版）----------------
-# OpenWrt 编译时会自动把源码根目录 files/ 合并进固件 rootfs。
-# 这里从 GITHUB_WORKSPACE/user-files 拷入，覆盖 argon 字体/模板并注入风扇/LED 控制。
+# ---------------- 自定义文件覆盖（315 字体/模板 + 新版风扇/RGB 插件）----------------
 if [ -d "$GITHUB_WORKSPACE/user-files" ]; then
   mkdir -p ./files
   cp -af "$GITHUB_WORKSPACE/user-files/." ./files/
-  chmod +x ./files/usr/sbin/fanctl ./files/usr/sbin/ledctl ./files/etc/init.d/fanctl ./files/etc/init.d/ledctl ./files/sbin/led.sh 2>/dev/null
-  echo "custom files overlaid: fan/led + 315 fonts/templates ($(find ./files -type f | wc -l) files)"
+
+  # GitHub REST API 上传的文件一律 100644，会丢可执行位。
+  # 后端脚本 + init 必须补回 755，否则界面 exec 全失败、守护起不来。
+  chmod 755 ./files/usr/sbin/fanctl ./files/usr/sbin/ledctl \
+            ./files/etc/init.d/fanctl ./files/etc/init.d/ledctl 2>/dev/null || :
+
+  # 双保险：清除上一版 SBE 全插件编译遗留的旧风扇/RGB 文件。
+  # 这些是「OW 自带」的旧界面/旧菜单/LED 触发器/pwmfan 模块项，
+  # 万兆不需要且与新菜单重复；即便远程 user-files 删漏了，这里也清干净。
+  rm -f ./files/usr/share/luci/menu.d/luci-app-fan.json \
+        ./files/usr/share/luci/menu.d/luci-app-led.json \
+        ./files/usr/share/rpcd/acl.d/luci-app-fan.json \
+        ./files/usr/share/rpcd/acl.d/luci-app-led.json \
+        ./files/www/luci-static/resources/view/system/fan.js \
+        ./files/www/luci-static/resources/view/system/led.js \
+        ./files/etc/board.d/01_leds \
+        ./files/etc/modules.d/60-hwmon-pwmfan \
+        ./files/lib/functions/leds.sh \
+        ./files/sbin/led.sh 2>/dev/null || :
+  rm -rf ./files/www/luci-static/resources/view/system/led-trigger 2>/dev/null || :
+
+  echo "315 fonts/templates + sbehw overlaid: $(find ./files -type f | wc -l) files"
 else
   echo "WARN: user-files not found, skip overlay"
 fi
 
-# ---------------- 品牌定制：登录页 + 左上角统一 ImmortalWRT ----------------
-# hostname 由 Settings.sh 依 WRT_NAME=ImmortalWRT 写入；argon 品牌字取 ubus system.board 的 hostname。
+# ---------------- 品牌定制：统一 ImmortalWRT ----------------
 CFG_GEN="./package/base-files/files/bin/config_generate"
 [ -f "$CFG_GEN" ] && sed -i "s/hostname='.*'/hostname='ImmortalWRT'/g; s/description='.*'/description='ImmortalWRT'/g" "$CFG_GEN"
 grep -rl -E 'ImmortalWrt|OpenWrt|OWRT' ./feeds/luci/modules/luci-base/htdocs/luci-static/resources/ ./package/emortal/luci-app-router-tool/ 2>/dev/null | xargs -r sed -i 's/ImmortalWrt/ImmortalWRT/g; s/OpenWrt/ImmortalWRT/g; s/OWRT/ImmortalWRT/g'
