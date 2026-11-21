@@ -1,0 +1,54 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+# 板级守卫：本插件只服务 SBE1V1K，绝不在小米万兆 BE10000 上运行
+# （两台机器风扇控制器/温控策略完全不同，见 luci-app-be10000）。
+board_ok() {
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
+		askey,sbe1v1k|sbe1v1k) return 0 ;;
+	esac
+	return 1
+}
+
+# 硬件守卫：后端只认 name=pwmfan 的 hwmon 节点（SBE1V1K 打过 DTS 补丁才有）。
+# 其它机型（如万兆 BE10000 用 I2C emc2305，风扇由内核 thermal 管）没有该节点：
+# 不启动守护、不写温区，避免空转，也不误抢内核风扇控制权。
+fan_hw_present() {
+	for d in /sys/class/hwmon/hwmon*; do
+		[ -r "$d/name" ] || continue
+		[ "$(cat "$d/name" 2>/dev/null)" = "pwmfan" ] && return 0
+	done
+	return 1
+}
+
+start_service() {
+	board_ok || {
+		logger -t fanctl "not SBE1V1K, daemon skipped" 2>/dev/null || :
+		return 0
+	}
+	fan_hw_present || {
+		logger -t fanctl "pwm-fan hwmon not found, daemon skipped (unsupported hardware)" 2>/dev/null || :
+		return 0
+	}
+
+	config_load fan
+	config_get mode fan mode auto
+
+	# 先把上次保存的模式落到硬件（auto 会恢复内核温区控制权）
+	# FAN_SKIP_APPLY=1 时跳过：此时调用方已经自己设好了转速
+	[ -n "$FAN_SKIP_APPLY" ] || FAN_NO_DAEMON=1 /usr/sbin/fanctl apply >/dev/null 2>&1
+
+	# 守护常驻：曲线模式按曲线调速；手动/停转模式只做过温兜底；
+	# 自动模式什么都不做（温区 governor 已交还内核）
+	procd_open_instance
+	procd_set_param command /usr/sbin/fanctl daemon
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+}
+
+stop_service() {
+	# 只停用户态守护；调速状态由 fanctl 自己接管，避免递归调用 init 脚本
+	:
+}
