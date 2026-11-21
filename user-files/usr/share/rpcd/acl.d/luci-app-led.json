@@ -1,0 +1,15 @@
+{
+	"luci-app-led": {
+		"description": "Grant access to LED control",
+		"read": {
+			"file": {
+				"/usr/sbin/ledctl": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/ledctl": [ "exec" ]
+			}
+		}
+	}
+}
