@@ -3,8 +3,17 @@
 START=99
 USE_PROCD=1
 
+# 板级守卫：本插件只服务 SBE1V1K，绝不在小米万兆 BE10000 上运行
+# （两台机器风扇控制器/温控策略完全不同，见 luci-app-be10000）。
+board_ok() {
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
+		askey,sbe1v1k|sbe1v1k) return 0 ;;
+	esac
+	return 1
+}
+
 # 硬件守卫：后端只认 name=pwmfan 的 hwmon 节点（SBE1V1K 打过 DTS 补丁才有）。
-# 其它机型（如万兆 BE10000 用 I2C emc2301，风扇由内核 thermal 管）没有该节点：
+# 其它机型（如万兆 BE10000 用 I2C emc2305，风扇由内核 thermal 管）没有该节点：
 # 不启动守护、不写温区，避免空转，也不误抢内核风扇控制权。
 fan_hw_present() {
 	for d in /sys/class/hwmon/hwmon*; do
@@ -15,6 +24,10 @@ fan_hw_present() {
 }
 
 start_service() {
+	board_ok || {
+		logger -t fanctl "not SBE1V1K, daemon skipped" 2>/dev/null || :
+		return 0
+	}
 	fan_hw_present || {
 		logger -t fanctl "pwm-fan hwmon not found, daemon skipped (unsupported hardware)" 2>/dev/null || :
 		return 0
