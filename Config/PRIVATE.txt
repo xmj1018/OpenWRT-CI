@@ -114,6 +114,7 @@ CONFIG_PACKAGE_bandix=y
 CONFIG_PACKAGE_unishare=y
 CONFIG_PACKAGE_taskd=y
 CONFIG_PACKAGE_luci-lib-taskd=y
+CONFIG_PACKAGE_luci-lib-xterm=y
 CONFIG_PACKAGE_docker-lan-bridge=y
 # unishare 的传递依赖（若源内有则选中；无则忽略，Kconfig 会跳过）
 CONFIG_PACKAGE_samba4-server=y
