@@ -1,0 +1,6 @@
+config led 'led'
+	option enabled '1'
+	option mode 'static'
+	option color '1e90ff'
+	option brightness '100'
+	option speed '3000'
