@@ -1,0 +1,412 @@
+#!/bin/sh
+# ledctl —— SBE1V1K 前置状态灯（RGB PWM LED）控制
+#
+# 三个 LED 在 /sys/class/leds/{red,green,blue}:status，pwm-leds 驱动，
+# max_brightness=255。颜色用 RRGGBB 表示，亮度为 0-100 的主控比例。
+#
+# 用法:
+#   ledctl json                              机器可读状态
+#   ledctl on|off                            启用/停用
+#   ledctl color <RRGGBB> [--nosave]         设置颜色（不落盘用 --nosave）
+#   ledctl brightness <0-100> [--nosave]     主控亮度
+#   ledctl mode <static|breath|blink|rainbow> 灯效
+#   ledctl speed <毫秒>                       呼吸/闪烁周期、彩虹速度
+#   ledctl apply                             按保存的配置生效
+#   ledctl daemon                            灯效守护（呼吸/闪烁/彩虹）
+#
+# 灯效：
+#   static   常亮（颜色+亮度固定）
+#   breath   呼吸（0 -> 目标亮度 -> 0 平滑渐变，周期=speed）
+#   blink    闪烁（目标亮度 <-> 灭，周期=speed）
+#   rainbow  彩虹循环（HSV 色相 6° 一档，60 档，周期=speed）
+
+. /lib/functions.sh
+
+CONF=/etc/config/led
+LED_R="/sys/class/leds/red:status"
+LED_G="/sys/class/leds/green:status"
+LED_B="/sys/class/leds/blue:status"
+
+# ---------- 时钟（/proc/uptime 秒.厘秒，10ms 精度） ----------
+now_ms() { awk '{printf "%d", $1*1000}' /proc/uptime; }
+wait_ms() {
+	end=$(( $(now_ms) + $1 ))
+	local g=0
+	while :; do
+		[ "$(now_ms)" -ge "$end" ] && return 0
+		g=$((g+1)); [ $g -gt 200000 ] && return 0
+	done
+}
+
+# 可中断等待：最多等 $1 ms，期间每 50ms 检查一次灯效状态
+#   返回 0 = 等满；返回 1 = 模式或周期变了，调用方应立即退出重读配置
+wait_ms_chk() {
+	local ms=$1 mode=$2 speed=$3 t0 elapsed
+	t0=$(now_ms)
+	while :; do
+		elapsed=$(( $(now_ms) - t0 ))
+		[ "$elapsed" -ge "$ms" ] && return 0
+		eff_changed "$mode" "$speed" && return 1
+		wait_ms 50
+	done
+}
+
+# ---------- 底层 ----------
+find_leds() {
+	[ -d "$LED_R" ] && [ -d "$LED_G" ] && [ -d "$LED_B" ] && return 0
+	# 名字可能带别的前缀，按 :status 后缀兜底找
+	LED_R=""; LED_G=""; LED_B=""
+	for l in /sys/class/leds/*:status; do
+		case "$l" in
+			*red*)   LED_R="$l" ;;
+			*green*) LED_G="$l" ;;
+			*blue*)  LED_B="$l" ;;
+		esac
+	done
+	[ -n "$LED_R" ] && [ -n "$LED_G" ] && [ -n "$LED_B" ]
+}
+
+# 接管：切到 none 触发器，否则 default-on/timer 等会覆盖 brightness
+takeover() {
+	find_leds || return 1
+	for l in "$LED_R" "$LED_G" "$LED_B"; do
+		echo none > "$l/trigger" 2>/dev/null
+	done
+}
+
+led_write() { echo "$2" > "$1/brightness" 2>/dev/null; }
+
+# 写三路原始值（已按亮度缩放过的 0-255）
+set_rgb() {
+	takeover
+	led_write "$LED_R" "$1"
+	led_write "$LED_G" "$2"
+	led_write "$LED_B" "$3"
+}
+
+all_off() {
+	takeover
+	led_write "$LED_R" 0
+	led_write "$LED_G" 0
+	led_write "$LED_B" 0
+}
+
+read_rgb() {
+	local r g b
+	r=$(cat "$LED_R/brightness" 2>/dev/null); [ -z "$r" ] && r=0
+	g=$(cat "$LED_G/brightness" 2>/dev/null); [ -z "$g" ] && g=0
+	b=$(cat "$LED_B/brightness" 2>/dev/null); [ -z "$b" ] && b=0
+	echo "$r $g $b"
+}
+
+# RRGGBB -> "r g b"（0-255 原始值）
+hex2rgb() {
+	local h r g b
+	h=$(echo "$1" | tr -d '#')
+	[ ${#h} -lt 6 ] && h="ffffff"
+	r=$(( $(printf "%d" "0x${h:0:2}") ))
+	g=$(( $(printf "%d" "0x${h:2:2}") ))
+	b=$(( $(printf "%d" "0x${h:4:2}") ))
+	echo "$r $g $b"
+}
+
+rgb2hex() {
+	printf "%02x%02x%02x" "$1" "$2" "$3"
+}
+
+# 按主控亮度缩放
+scale() { echo $(( ($1 * $2 + 50) / 100 )); }
+
+# 当前保存的灯效模式（灯效循环每步检查一次，变了就立即退出回到外层重读配置）
+cur_mode() { uci -q get led.@led[0].mode 2>/dev/null; }
+
+# 当前保存的周期（毫秒）
+cur_speed() { uci -q get led.@led[0].speed 2>/dev/null; }
+
+# 灯效运行中检查状态：模式变了 或 周期变了 → 返回 0（需要退出重读）
+# 只查模式的话，改了周期要等一整圈跑完（彩虹最长 60 秒）才生效，体感像「设置无效」
+eff_changed() {
+	local mode=$1 speed=$2 cur
+	cur=$(cur_mode)
+	[ "$cur" != "$mode" ] && return 0
+	cur=$(cur_speed)
+	# 两边都规范化后再比，否则 /etc/config/led 里的原始值
+	# 与守护进程里的规范化值永远不等，会导致灯效一进去就退出、死循环
+	case "$cur" in ''|*[!0-9]*) cur=3000 ;; esac
+	[ "$cur" -lt 200 ] && cur=200
+	[ "$cur" -gt 60000 ] && cur=60000
+	[ "$cur" != "$speed" ] && return 0
+	return 1
+}
+
+uci_set() {
+	[ -f "$CONF" ] || return 0
+	uci set "$@" 2>/dev/null && uci commit led 2>/dev/null
+}
+
+# ---------- 灯效 ----------
+# 呼吸：0 -> 目标 -> 0，N 步，总周期 speed ms
+do_breath() {
+	local r=$1 g=$2 b=$3 speed=$4 i n up cur
+	[ "$speed" -lt 200 ] && speed=200
+	n=40
+	step=$(( speed / (n*2) ))
+	[ "$step" -lt 10 ] && step=10
+	# 亮起
+	i=0
+	while [ $i -lt $n ]; do
+		eff_changed breath "$speed" && return 0
+		cur=$(( (i+1) * 255 / n ))
+		set_rgb $(( r*cur/255 )) $(( g*cur/255 )) $(( b*cur/255 ))
+		i=$((i+1))
+		wait_ms_chk $step breath "$speed" || return 0
+	done
+	# 熄灭
+	i=0
+	while [ $i -lt $n ]; do
+		eff_changed breath "$speed" && return 0
+		cur=$(( (n-i) * 255 / n ))
+		set_rgb $(( r*cur/255 )) $(( g*cur/255 )) $(( b*cur/255 ))
+		i=$((i+1))
+		wait_ms_chk $step breath "$speed" || return 0
+	done
+}
+
+# 彩虹：60 档 HSV 循环
+RAINBOW="255 0 0
+255 25 0
+255 51 0
+255 77 0
+255 102 0
+255 128 0
+255 153 0
+255 178 0
+255 204 0
+255 229 0
+255 255 0
+230 255 0
+204 255 0
+178 255 0
+153 255 0
+128 255 0
+102 255 0
+77 255 0
+51 255 0
+26 255 0
+0 255 0
+0 255 25
+0 255 51
+0 255 77
+0 255 102
+0 255 128
+0 255 153
+0 255 179
+0 255 204
+0 255 229
+0 255 255
+0 229 255
+0 204 255
+0 178 255
+0 153 255
+0 128 255
+0 102 255
+0 76 255
+0 51 255
+0 25 255
+0 0 255
+25 0 255
+51 0 255
+76 0 255
+102 0 255
+128 0 255
+153 0 255
+179 0 255
+204 0 255
+230 0 255
+255 0 255
+255 0 230
+255 0 204
+255 0 179
+255 0 153
+255 0 128
+255 0 102
+255 0 77
+255 0 51
+255 0 26"
+
+do_rainbow() {
+	local bright=$1 speed=$2 i step rgb r g b
+	[ "$speed" -lt 200 ] && speed=200
+	step=$(( speed / 60 ))
+	[ "$step" -lt 10 ] && step=10
+	i=0
+	# 一轮 60 步（360° 色环），跑完回到外层重读配置；
+	# 每步检查模式/周期是否已变，变了立即退出，切换灯效与改周期都即时生效
+	while [ $i -lt 60 ]; do
+		eff_changed rainbow "$speed" && return 0
+		rgb=$(echo "$RAINBOW" | awk -v n=$i 'NR==n+1')
+		set -- $rgb
+		set_rgb $(( $1*bright/100 )) $(( $2*bright/100 )) $(( $3*bright/100 ))
+		i=$((i+1))
+		wait_ms_chk $step rainbow "$speed" || return 0
+	done
+}
+
+# ---------- 动作 ----------
+do_on()  { uci_set led.@led[0].enabled='1'; ensure_daemon; }
+do_off() { uci_set led.@led[0].enabled='0'; all_off; ensure_daemon; }
+
+apply_color() {
+	local hex=$1 bright=$2 nosave=$3 rgb r g b
+	hex=$(echo "$hex" | tr -d '#')
+	[ ${#hex} -lt 6 ] && hex="ffffff"
+	rgb=$(hex2rgb "$hex")
+	set -- $rgb
+	r=$(scale "$1" "$bright")
+	g=$(scale "$2" "$bright")
+	b=$(scale "$3" "$bright")
+	set_rgb "$r" "$g" "$b"
+	[ "$nosave" = "--nosave" ] && return 0
+	uci_set led.@led[0].color="$hex"
+	ensure_daemon
+}
+
+apply_brightness() {
+	local bright=$1 nosave=$2
+	case "$bright" in ''|*[!0-9]*) bright=100 ;; esac
+	[ "$bright" -gt 100 ] && bright=100
+	[ "$bright" -lt 0 ] && bright=0
+	# 重新按新亮度渲染当前颜色
+	config_load led
+	config_get c led color "ffffff"
+	config_get en led enabled 1
+	[ "$en" = "0" ] && { all_off; [ "$nosave" = "--nosave" ] && return 0; uci_set led.@led[0].brightness="$bright"; return 0; }
+	local rgb r g b
+	rgb=$(hex2rgb "$c")
+	set -- $rgb
+	set_rgb "$(scale "$1" "$bright")" "$(scale "$2" "$bright")" "$(scale "$3" "$bright")"
+	[ "$nosave" = "--nosave" ] && return 0
+	uci_set led.@led[0].brightness="$bright"
+	ensure_daemon
+}
+
+apply_mode() {
+	local m=$1
+	case "$m" in static|breath|blink|rainbow) ;; *) return 1 ;; esac
+	uci_set led.@led[0].mode="$m"
+	ensure_daemon
+}
+
+apply_speed() {
+	local s=$1
+	case "$s" in ''|*[!0-9]*) s=3000 ;; esac
+	[ "$s" -lt 200 ] && s=200
+	[ "$s" -gt 60000 ] && s=60000
+	uci_set led.@led[0].speed="$s"
+	ensure_daemon
+}
+
+ensure_daemon() {
+	[ -n "$LED_NO_DAEMON" ] && return 0
+	[ -x /etc/init.d/ledctl ] || return 0
+	pgrep -f "ledctl daemon" >/dev/null 2>&1 && return 0
+	LED_SKIP_APPLY=1 /etc/init.d/ledctl start >/dev/null 2>&1
+}
+
+# 守护：按保存的配置持续渲染灯效
+do_daemon() {
+	while :; do
+		config_load led
+		config_get en   led enabled 1
+		config_get mode led mode    static
+		config_get color led color  "ffffff"
+		config_get bright led brightness 100
+		config_get speed led speed   3000
+		case "$speed" in ''|*[!0-9]*) speed=3000 ;; esac
+		[ "$speed" -lt 200 ] && speed=200
+		[ "$speed" -gt 60000 ] && speed=60000
+
+		if [ "$en" = "0" ]; then
+			all_off
+			sleep 1
+			continue
+		fi
+
+		rgb=$(hex2rgb "$color")
+		set -- $rgb
+		r=$(scale "$1" "$bright")
+		g=$(scale "$2" "$bright")
+		b=$(scale "$3" "$bright")
+
+		case "$mode" in
+			static)  set_rgb "$r" "$g" "$b"; wait_ms_chk 1000 static "$speed" ;;
+			blink)
+				set_rgb "$r" "$g" "$b"
+				wait_ms_chk $(( speed/2 )) blink "$speed" || continue
+				all_off
+				wait_ms_chk $(( speed/2 )) blink "$speed" || continue ;;
+			breath)  do_breath "$r" "$g" "$b" "$speed" ;;
+			rainbow) do_rainbow "$bright" "$speed" ;;
+		esac
+	done
+}
+
+do_apply() {
+	config_load led
+	config_get en   led enabled 1
+	config_get mode led mode    static
+	config_get color led color  "ffffff"
+	config_get bright led brightness 100
+	config_get speed led speed   3000
+	[ "$en" = "0" ] && { all_off; return 0; }
+	case "$mode" in
+		static) apply_color "$color" "$bright" "--nosave" ;;
+		*) : ;;   # 灯效由守护渲染
+	esac
+	ensure_daemon
+}
+
+# ---------- 输出 ----------
+do_json() {
+	find_leds || { echo '{"ok":false}'; return 1; }
+	config_load led
+	config_get en   led enabled 1
+	config_get mode led mode    static
+	config_get color led color  "ffffff"
+	config_get bright led brightness 100
+	config_get speed led speed   3000
+
+	read_rgb > /tmp/.led-rgb.$$
+	set -- $(cat /tmp/.led-rgb.$$)
+	rm -f /tmp/.led-rgb.$$
+	ar=$1; ag=$2; ab=$3
+	[ -z "$ar" ] && ar=0; [ -z "$ag" ] && ag=0; [ -z "$ab" ] && ab=0
+	active=0
+	[ $(( ar+ag+ab )) -gt 0 ] && active=1
+	hex=$(rgb2hex "$ar" "$ag" "$ab")
+
+	echo "{\"ok\":true,\"enabled\":$en,\"mode\":\"$mode\",\"color\":\"$color\",\"brightness\":$bright,\"speed\":$speed,\"active\":$active,\"actual\":\"$hex\",\"r\":$ar,\"g\":$ag,\"b\":$ab}"
+}
+
+# ---------- 分发 ----------
+case "$1" in
+	json)       do_json ;;
+	on)         do_on ;;
+	off)        do_off ;;
+	color)
+		b=""
+		[ "$3" = "--nosave" ] && b="--nosave"
+		config_load led; config_get br led brightness 100
+		apply_color "$2" "$br" "$b" ;;
+	brightness)
+		b=""
+		[ "$3" = "--nosave" ] && b="--nosave"
+		apply_brightness "$2" "$b" ;;
+	mode)       apply_mode "$2" ;;
+	speed)      apply_speed "$2" ;;
+	apply)      do_apply ;;
+	daemon)     do_daemon ;;
+	*)
+		echo "用法: $0 {json|on|off|color <RRGGBB>|brightness <0-100>|mode <static|breath|blink|rainbow>|speed <ms>|apply|daemon}"
+		exit 1 ;;
+esac
