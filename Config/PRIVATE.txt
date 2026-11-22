@@ -1,8 +1,11 @@
 # ============================================================
-# PRIVATE.txt - 小米万兆 BE10000 精简版（目标 ~80-90MB，能启动）
-# 官方基线不动，只加：honk + OAF + iStoreOS 风格 + HomeProxyRE
-#   + Argon 默认主题 + 315 字体/模板
-#   + 两个机型专属风扇/RGB 插件同时内置：luci-app-sbe1v1k + luci-app-be10000
+# PRIVATE.txt - SBE1V1K 【单机型】精简版（目标 ~80-90MB，能启动）
+# 用户 08:51 指令：一个一个来，先只编 SBE1V1K，把万兆风扇那套去掉；
+#          08:53 补：正常保留这个配置，另外把 OpenClash 加进来。
+# 配方照旧：honk + OAF + iStoreOS 风格 + HomeProxyRE + Argon 默认主题
+#   + 315 字体/模板 + luci-app-router-tool(上游自带)
+#   + 仅 luci-app-sbe1v1k（rootfs 里没有任何 be10000 插件/驱动）
+#   + OpenClash
 # 不加：Docker / emmc-health / 36 插件全集 / 旧版自带 LED 触发器 / 旧 sbehw
 # ============================================================
 
@@ -102,18 +105,41 @@ CONFIG_PACKAGE_libopenssl=y
 CONFIG_PACKAGE_libcurl=y
 CONFIG_PACKAGE_zlib=y
 
-# ---------- 两个 hwctrl 界面插件的 rpc 依赖 ----------
-# 界面用 ubus file.exec 调后端（fanctl/ledctl、be10000-fanctl/ledctl），
+# ---------- 本机 hwctrl 界面插件的 rpc 依赖 ----------
+# 界面用 ubus file.exec 调 /usr/sbin/fanctl、/usr/sbin/ledctl，
 # 需 rpcd-mod-file 提供 file 对象；官方基线未显式选，这里补上，否则点开「无响应」。
 CONFIG_PACKAGE_rpcd-mod-file=y
 
-# ---------- 两个机型硬件驱动（上游 DTS 已有节点，只是基线设成 =m 未入镜像）----------
-# 万兆 BE10000：I2C EMC2301/2305 风扇 @0x2f + pwm-leds 三色 :ambient
-# SBE1V1K    ：pwm-fan (cooling-levels 36/72/128/255) + pwm-leds 三色 :status
-# 装进镜像后，两个 init 的硬件守卫才会通过，风扇调速 / RGB 灯效才真正可用。
-CONFIG_PACKAGE_kmod-hwmon-emc2305=y
+# ---------- SBE1V1K 本机硬件驱动（上游 DTS 已有节点，基线设成 =m 未入镜像）----------
+# ipq9570-sbe1v1k.dts: pwm-fan (cooling-levels 36/72/128/255) + pwm-leds 三色 :status
+# 万兆专用的 kmod-hwmon-emc2305 在这里【不选】，SBE 固件里不带任何万兆驱动。
 CONFIG_PACKAGE_kmod-hwmon-pwmfan=y
 CONFIG_PACKAGE_kmod-leds-pwm=y
+
+# ---------- luci-app-route-tool（用户口头写法）= 上游自带 luci-app-router-tool ----------
+# 基线本来就是 =y（manifest 20261118-r5），用户要求加进去，这里显式锁死确保不会漏。
+CONFIG_PACKAGE_luci-app-router-tool=y
+CONFIG_PACKAGE_luci-i18n-router-tool-zh-cn=y
+
+# ---------- OpenClash（用户 08:53 要求，SBE1V1K 先加；后期万兆也要加）----------
+# 源码由官方 Scripts/Packages.sh 的
+#   UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "dev" "pkg"
+# 克隆，包已在 .config 里可见（默认 not set），这里选 y 即可，不要重复克隆。
+# 其 Makefile 的 config 段会自动带出 kmod-inet-diag / luci-compat /
+# kmod-nft-tproxy / dnsmasq_full_nftset 等依赖；dnsmasq-full 基线已是 =y。
+CONFIG_PACKAGE_luci-app-openclash=y
+
+# ---------- 只编一个机型：SBE1V1K ----------
+# IPQ95XX.txt 默认一次启用 6 个 DEVICE，CI 只有一个 job，files/ 覆盖是全局的，
+# 会把两套机型插件同时塞进每个固件（界面出现两个「风扇控制」）。
+# PRIVATE.txt 是最后 cat 进 .config 的、优先级最高，这里把其它 5 个全部关掉，
+# 一次只出 SBE1V1K 的 factory + sysupgrade 两个文件。
+CONFIG_TARGET_DEVICE_qualcommbe_ipq95xx_DEVICE_askey_sbe1v1k=y
+CONFIG_TARGET_DEVICE_qualcommbe_ipq95xx_DEVICE_nokia_beacon-10=n
+CONFIG_TARGET_DEVICE_qualcommbe_ipq95xx_DEVICE_xiaomi_be7000=n
+CONFIG_TARGET_DEVICE_qualcommbe_ipq95xx_DEVICE_xiaomi_be7000-es=n
+CONFIG_TARGET_DEVICE_qualcommbe_ipq95xx_DEVICE_xiaomi_be10000=n
+CONFIG_TARGET_DEVICE_qualcommbe_ipq95xx_DEVICE_xiaomi_be10000-es=n
 
 # ---------- 固件体积/分区相关 ----------
 CONFIG_TARGET_ROOTFS_SQUASHFS=y
