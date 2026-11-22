@@ -1,21 +1,18 @@
 #!/bin/sh
-# 首次开机启用两个机型专属硬件控制守护。
-# 两个 init 内都带 board_name + 硬件节点双重守卫：
-#   - xiaomi,be10000        -> be10000-fan / be10000-led 生效，fanctl/ledctl 自动跳过
-#   - askey,sbe1v1k         -> fanctl / ledctl 生效，be10000-* 自动跳过
-# 因此把两套插件同时内置到所有机型镜像里是安全的，不会抢内核风扇控制权。
+# SBE1V1K 单机型固件：开机启用本机风扇/RGB 守护。
+# 本固件只内置 luci-app-sbe1v1k 一套插件，rootfs 里没有任何万兆 BE10000 的文件。
+# init 内仍有 board_name + pwmfan/:status 硬件守卫，非本机不会启动守护。
 
-for s in fanctl ledctl be10000-fan be10000-led; do
+for s in fanctl ledctl; do
 	[ -x "/etc/init.d/$s" ] || continue
 	"/etc/init.d/$s" enable >/dev/null 2>&1 || :
 done
 
-# 固件若自带旧版风扇/RGB 综合界面，禁用其菜单，避免两套控制抢同一硬件。
+# 固件若自带旧版风扇/RGB 界面，禁用其菜单，避免出现重复菜单。
 # 只改名不删除，随时可恢复。
 for f in /usr/share/luci/menu.d/luci-app-fan.json \
          /usr/share/luci/menu.d/luci-app-led.json \
-         /usr/share/luci/menu.d/luci-app-sbehw.json \
-         /usr/share/luci/menu.d/luci-app-xiaomi-control.json; do
+         /usr/share/luci/menu.d/luci-app-sbehw.json; do
 	[ -f "$f" ] && mv "$f" "$f.disabled-by-hwctrl" 2>/dev/null || :
 done
 
